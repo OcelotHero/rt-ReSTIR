@@ -6,7 +6,6 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 use winit::dpi::LogicalSize;
 
-use ash::khr::portability_enumeration::*;
 use ash::vk::InstanceCreateFlags;
 
 // use ash::version::IntanceV1_0;
@@ -14,7 +13,7 @@ use ash::vk::InstanceCreateFlags;
 #[cfg(target_os = "macos")]
 pub fn required_extension_names() -> Vec<*const i8> {
     vec![
-        KHR_PORTABILITY_ENUMERATION_NAME.name().as_ptr(),
+        ash::vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr(),
     ]
 }
 
