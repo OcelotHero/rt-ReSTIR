@@ -21,6 +21,17 @@ const VALIDATION: ValidationInfo = ValidationInfo {
     required_validation_layers: [ "VK_LAYER_KHRONOS_validation" ],
 };
 
+struct QueueFamilyIndices {
+    graphics_family: Option<u32>,
+}
+
+impl QueueFamilyIndices {
+    pub fn is_complete(&self) -> bool {
+        self.graphics_family.is_some()
+    }
+}
+
+
 struct ValidationInfo {
     is_enabled: bool,
     required_validation_layers: [&'static str; 1],
@@ -33,6 +44,7 @@ struct HelloTriangleApplication {
     instance: Option<ash::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
     debug_utils_instance: Option<ash::ext::debug_utils::Instance>,
+    _physical_device: Option<vk::PhysicalDevice>,
 }
 
 impl ApplicationHandler for HelloTriangleApplication {
@@ -168,6 +180,7 @@ impl HelloTriangleApplication {
     fn init_vulkan(&mut self) {
         self.create_instance();
         self.setup_debug_messenger();
+        self.pick_physical_device();
     }
 
     fn create_instance(&mut self) {
@@ -267,6 +280,74 @@ impl HelloTriangleApplication {
 
         self.debug_utils_instance = Some(debug_utils_loader);
         self.debug_messenger = Some(debug_messenger);
+    }
+
+    fn pick_physical_device(&mut self) {
+        let physical_devices = unsafe {
+            self.instance
+                .as_ref()
+                .unwrap()
+                .enumerate_physical_devices()
+                .expect("Failed to enumerate Physical Devices!")
+        };
+
+        println!(
+            "{} devices (GPU) found with vulkan support.",
+            physical_devices.len()
+        );
+
+        let physical_device = physical_devices
+            .iter()
+            .find(|&device| { self.is_device_suitable(device) });
+
+        match physical_device {
+            Some(device) => self._physical_device = Some(*device),
+            None => panic!("Failed to find a suitable GPU!"),
+        }
+    }
+
+    fn is_device_suitable(&self, device: &vk::PhysicalDevice) -> bool {
+        let device_properties = unsafe {
+            self.instance
+                .as_ref()
+                .unwrap()
+                .get_physical_device_properties(*device)
+        };
+        let device_name = vk_to_string(&device_properties.device_name);
+        println!("\tDevice Name: {}", device_name);
+
+        let indices = self.find_queue_family(*device);
+        indices.is_complete()
+    }
+
+    fn find_queue_family(&self, device: vk::PhysicalDevice) -> QueueFamilyIndices {
+        let queue_families = unsafe {
+            self.instance
+                .as_ref()
+                .unwrap()
+                .get_physical_device_queue_family_properties(device)
+        };
+
+        let mut queue_family_indices = QueueFamilyIndices {
+            graphics_family: None,
+        };
+
+        let mut index = 0;
+        for queue_family in queue_families.iter() {
+            if queue_family.queue_count > 0
+                && queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            {
+                queue_family_indices.graphics_family = Some(index);
+            }
+
+            if queue_family_indices.is_complete() {
+                break;
+            }
+
+            index += 1;
+        }
+
+        queue_family_indices
     }
 
     fn main_loop(&mut self, _event_loop: &ActiveEventLoop) {
