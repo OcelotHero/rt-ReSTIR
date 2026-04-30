@@ -100,6 +100,8 @@ struct Engine {
     debug_utils_instance: Option<ext::debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
     _physical_device: vk::PhysicalDevice,
+    device: ash::Device,
+    _graphics_queue: vk::Queue,
 }
 
 impl Engine {
@@ -109,6 +111,7 @@ impl Engine {
         let (debug_utils_instance, debug_messenger) =
             Self::setup_debug_messenger(&entry, &instance)?;
         let physical_device = Self::pick_physical_device(&instance)?;
+        let (device, graphics_queue) = Self::create_logical_device(&instance, physical_device)?;
 
         Ok(Engine {
             _entry: entry,
@@ -116,27 +119,9 @@ impl Engine {
             debug_utils_instance,
             debug_messenger,
             _physical_device: physical_device,
+            device,
+            _graphics_queue: graphics_queue,
         })
-    }
-
-    fn pick_physical_device(instance: &ash::Instance) -> Result<vk::PhysicalDevice> {
-        let physical_devices = unsafe {
-            instance
-                .enumerate_physical_devices()
-                .context("Failed to enumerate Physical Devices!")?
-        };
-
-        println!(
-            "{} devices (GPU) found with vulkan support.",
-            physical_devices.len()
-        );
-
-        let physical_device = physical_devices
-            .iter()
-            .find(|&device| { Self::is_device_suitable(&instance, *device) })
-            .ok_or_else(|| anyhow!("Failed to find a suitable GPU!"))?;
-
-        Ok(*physical_device)
     }
 
     fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
@@ -163,7 +148,6 @@ impl Engine {
             #[cfg(target_os = "macos")]
             vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr(),
          ];
-
         if VALIDATION.enabled {
             required_extensions.push(vk::EXT_DEBUG_UTILS_NAME.as_ptr());
         }
@@ -283,11 +267,81 @@ impl Engine {
 
         queue_family_indices
     }
+
+    fn pick_physical_device(instance: &ash::Instance) -> Result<vk::PhysicalDevice> {
+        let physical_devices = unsafe {
+            instance
+                .enumerate_physical_devices()
+                .context("Failed to enumerate Physical Devices!")?
+        };
+
+        println!(
+            "{} devices (GPU) found with vulkan support.",
+            physical_devices.len()
+        );
+
+        let physical_device = physical_devices
+            .iter()
+            .find(|&device| { Self::is_device_suitable(&instance, *device) })
+            .ok_or_else(|| anyhow!("Failed to find a suitable GPU!"))?;
+
+        Ok(*physical_device)
+    }
+
+    fn create_logical_device(instance: &ash::Instance, physical_device: vk::PhysicalDevice)
+        -> Result<(ash::Device, vk::Queue)> {
+        let indices = Self::find_queue_family(instance, physical_device);
+
+        let queue_priority = [1.0_f32];
+        let queue_create_info = vk::DeviceQueueCreateInfo {
+            s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::DeviceQueueCreateFlags::empty(),
+            queue_family_index: indices.graphics_family.unwrap(),
+            queue_count: 1,
+            p_queue_priorities: queue_priority.as_ptr(),
+            _marker: std::marker::PhantomData,
+        };
+
+        let device_features = vk::PhysicalDeviceFeatures::default();
+
+        let mut create_info = vk::DeviceCreateInfo::default();
+        create_info.s_type = vk::StructureType::DEVICE_CREATE_INFO;
+        create_info.queue_create_info_count = 1;
+        create_info.p_queue_create_infos = &queue_create_info;
+        create_info.p_enabled_features = &device_features;
+
+        let validation_layers_raw: Vec<CString> = VALIDATION
+            .required_validation_layers
+            .iter()
+            .map(|layer_name| CString::new(*layer_name).unwrap())
+            .collect();
+        let validation_layers: Vec<*const i8> = validation_layers_raw
+            .iter()
+            .map(|layer_name| layer_name.as_ptr())
+            .collect();
+
+        if VALIDATION.enabled {
+            create_info.enabled_layer_count = validation_layers.len() as u32;
+            create_info.pp_enabled_layer_names = validation_layers.as_ptr();
+        }
+
+        let device = unsafe {
+            instance
+                .create_device(physical_device, &create_info, None)
+                .context("Failed to create Logical Device!")?
+        };
+
+        let graphics_queue = unsafe { device.get_device_queue(indices.graphics_family.unwrap(), 0) };
+
+        Ok((device, graphics_queue))
+    }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_device(None);
             if VALIDATION.enabled {
                 if let (Some(loader), Some(messenger)) = (&self.debug_utils_instance, &self.debug_messenger) {
                     loader.destroy_debug_utils_messenger(*messenger, None);
