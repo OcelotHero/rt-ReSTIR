@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+num = "0.4.3"
 anyhow = "1.0"
 ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
