@@ -120,6 +120,7 @@ struct Engine {
     _swapchain_format: vk::Format,
     _swapchain_extent: vk::Extent2D,
     _swapchain_images: Vec<vk::Image>,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 
 impl Engine {
@@ -138,6 +139,7 @@ impl Engine {
             unsafe { device.get_device_queue(family_indices.present_family.context("Present")?, 0) };
         let (swapchain_instance, swapchain, image_format, extent, images) =
             Self::create_swapchain(&instance, &device, physical_device, &surface_instance, &surface)?;
+        let swapchain_image_views = Self::create_image_views(&device, image_format, &images)?;
 
         Ok(Engine {
             _entry: entry,
@@ -155,6 +157,7 @@ impl Engine {
             _swapchain_format: image_format,
             _swapchain_extent: extent,
             _swapchain_images: images,
+            swapchain_image_views,
         })
     }
 
@@ -577,11 +580,46 @@ impl Engine {
             }
         }
     }
+
+    fn create_image_views(
+        device: &ash::Device,
+        format: vk::Format,
+        images: &Vec<vk::Image>,
+    ) -> Result<Vec<vk::ImageView>> {
+        let mut image_views = Vec::with_capacity(images.len());
+
+        for &image in images.iter() {
+            let create_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .components(vk::ComponentMapping::default())
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+
+            let image_view = unsafe {
+                device
+                    .create_image_view(&create_info, None)
+                    .context("Failed to create Image View!")?
+            };
+            image_views.push(image_view);
+        }
+
+        Ok(image_views)
+    }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
         unsafe {
+            for &image_view in self.swapchain_image_views.iter() {
+                self.device.destroy_image_view(image_view, None);
+            }
             self.swapchain_instance.destroy_swapchain(self.swapchain, None);
             self.device.destroy_device(None);
             self.surface_instance.destroy_surface(self.surface, None);
