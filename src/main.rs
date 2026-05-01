@@ -12,7 +12,7 @@ use ash::{vk, ext, khr};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -21,6 +21,7 @@ const VALIDATION: ValidationInfo = ValidationInfo {
     enabled: true,
     required_validation_layers: [ "VK_LAYER_KHRONOS_validation" ],
 };
+const DEVICE_EXTENSIONS: [&'static str; 1] = [ "VK_KHR_swapchain" ];
 
 #[derive(Default)]
 struct QueueFamilyIndices {
@@ -67,18 +68,17 @@ unsafe extern "system" fn debug_callback(
     vk::FALSE
 }
 
-fn vk_to_string(raw_string_array: &[c_char]) -> String {
+fn vk_to_string(raw_string_array: &[c_char]) -> Result<String> {
     let raw_string = unsafe {
         let pointer = raw_string_array.as_ptr();
         CStr::from_ptr(pointer)
     };
 
-    raw_string
+    Ok(raw_string
         .to_str()
-        .expect("Failed to convert vulkan raw string.")
-        .to_owned()
+        .context("Failed to convert vulkan raw string.")?
+        .to_owned())
 }
-
 
 fn populate_debug_messenger_create_info(
     create_info: &mut vk::DebugUtilsMessengerCreateInfoEXT
@@ -214,14 +214,14 @@ impl Engine {
         } else {
             println!("Instance Available Layers: ");
             for layer in layer_properties.iter() {
-                let layer_name = vk_to_string(&layer.layer_name);
+                let layer_name = vk_to_string(&layer.layer_name)?;
                 println!("\t{}", layer_name);
             }
         }
 
         'layer: for layer_name in VALIDATION.required_validation_layers.iter() {
             for layer_property in layer_properties.iter() {
-                let test_layer_name = vk_to_string(&layer_property.layer_name);
+                let test_layer_name = vk_to_string(&layer_property.layer_name)?;
                 if (*layer_name) == test_layer_name {
                     continue 'layer;
                 }
@@ -256,13 +256,47 @@ impl Engine {
         device: vk::PhysicalDevice,
         surface_instance: &khr::surface::Instance,
         surface: &vk::SurfaceKHR
-    ) -> bool {
+    ) -> Result<bool> {
         let device_properties = unsafe { instance.get_physical_device_properties(device) };
-        let device_name = vk_to_string(&device_properties.device_name);
+        let device_name = vk_to_string(&device_properties.device_name)?;
         println!("\tDevice Name: {}", device_name);
 
-        let indices = Self::find_queue_family(instance, device, surface_instance, surface);
-        indices.is_complete()
+        let indices = Self::find_queue_family(instance, device, surface_instance, surface)?;
+        let extensions_supported = Self::check_device_extension_support(instance, device)?;
+
+        Ok(indices.is_complete() && extensions_supported)
+    }
+
+    fn check_device_extension_support(instance: &ash::Instance, device: vk::PhysicalDevice)
+        -> Result<bool> {
+        let extension_properties = unsafe {
+            instance
+                .enumerate_device_extension_properties(device)
+                .context("Failed to enumerate Device Extension Properties!")?
+        };
+
+        if extension_properties.is_empty() {
+            eprintln!("No available device extensions.");
+            return Ok(false);
+        } else {
+            println!("Available Device Extensions: ");
+            for extension in extension_properties.iter() {
+                let extension_name = vk_to_string(&extension.extension_name)?;
+                println!("\t\tName: {}, Version: {}", extension_name, extension.spec_version);
+            }
+        }
+
+        'extension: for required_extension in DEVICE_EXTENSIONS.iter() {
+            for extension in extension_properties.iter() {
+                let extension_name = vk_to_string(&extension.extension_name)?;
+                if (*required_extension) == extension_name {
+                    continue 'extension;
+                }
+            }
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     fn find_queue_family(
@@ -270,7 +304,7 @@ impl Engine {
         device: vk::PhysicalDevice,
         surface_instance: &khr::surface::Instance,
         surface: &vk::SurfaceKHR
-    ) -> QueueFamilyIndices {
+    ) -> Result<QueueFamilyIndices> {
         let queue_families = unsafe { instance.get_physical_device_queue_family_properties(device) };
 
         let mut queue_family_indices = QueueFamilyIndices::default();
@@ -292,7 +326,7 @@ impl Engine {
             }
         }
 
-        queue_family_indices
+        Ok(queue_family_indices)
     }
 
     fn pick_physical_device(
@@ -311,10 +345,14 @@ impl Engine {
             physical_devices.len()
         );
 
-        let physical_device = physical_devices
-            .iter()
-            .find(|&device| { Self::is_device_suitable(&instance, *device, surface_instance, surface) })
-            .ok_or_else(|| anyhow!("Failed to find a suitable GPU!"))?;
+        let physical_device = 'selection: {
+            for device in physical_devices.iter() {
+                if Self::is_device_suitable(instance, *device, surface_instance, surface)? {
+                    break 'selection device;
+                }
+            }
+            bail!("Failed to find a suitable GPU!")
+        };
 
         Ok(*physical_device)
     }
@@ -325,7 +363,7 @@ impl Engine {
         surface_instance: &khr::surface::Instance,
         surface: &vk::SurfaceKHR
     ) -> Result<(ash::Device, QueueFamilyIndices)> {
-        let indices = Self::find_queue_family(instance, physical_device, surface_instance, surface);
+        let indices = Self::find_queue_family(instance, physical_device, surface_instance, surface)?;
 
         let unique_queue_families = [indices.graphics_family, indices.present_family]
             .iter()
@@ -344,9 +382,19 @@ impl Engine {
 
         let device_features = vk::PhysicalDeviceFeatures::default();
 
+        let device_extensions_raw: Vec<CString> = DEVICE_EXTENSIONS
+            .iter()
+            .map(|ext_name| CString::new(*ext_name).unwrap())
+            .collect();
+        let device_extensions: Vec<*const i8> = device_extensions_raw
+            .iter()
+            .map(|ext_name| ext_name.as_ptr())
+            .collect();
+
         let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_info)
-            .enabled_features(&device_features);
+            .enabled_features(&device_features)
+            .enabled_extension_names(&device_extensions);
 
         let validation_layers_raw: Vec<CString> = VALIDATION
             .required_validation_layers
