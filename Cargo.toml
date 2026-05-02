@@ -10,3 +10,4 @@ ash = { version = "0.38.0", features = ["linked"] }
 ash-window = "0.13.0"
 winit = { version = "0.30.13", features = ["rwh_06"] }
 raw-window-handle = "0.6"
+inline-spirv = "0.2.1"

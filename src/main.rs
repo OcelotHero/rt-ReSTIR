@@ -14,6 +14,8 @@ use std::os::raw::{c_char, c_void};
 
 use anyhow::{bail, ensure, Context, Result};
 
+use inline_spirv::include_spirv;
+
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
 
@@ -124,6 +126,10 @@ struct Engine {
     _swapchain_extent: vk::Extent2D,
     _swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+
+    _render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    graphics_pipeline: vk::Pipeline,
 }
 
 impl Engine {
@@ -133,6 +139,7 @@ impl Engine {
         let (surface_instance, surface) = Self::create_surface(&entry, &instance, window)?;
         let (debug_utils_instance, debug_messenger) =
             Self::setup_debug_messenger(&entry, &instance)?;
+
         let physical_device = Self::pick_physical_device(&instance, &surface_instance, &surface)?;
         let (device, family_indices) =
             Self::create_logical_device(&instance, physical_device, &surface_instance, &surface)?;
@@ -140,9 +147,14 @@ impl Engine {
             unsafe { device.get_device_queue(family_indices.graphics_family.context("Graphics")?, 0) };
         let present_queue =
             unsafe { device.get_device_queue(family_indices.present_family.context("Present")?, 0) };
+
         let (swapchain_instance, swapchain, image_format, extent, images) =
             Self::create_swapchain(&instance, &device, physical_device, &surface_instance, &surface)?;
         let swapchain_image_views = Self::create_image_views(&device, image_format, &images)?;
+
+        let render_pass = Self::create_render_pass(&device, image_format)?;
+        let (pipeline_layout, graphics_pipeline) =
+            Self::create_graphics_pipeline(&device, extent, render_pass)?;
 
         Ok(Engine {
             _entry: entry,
@@ -151,16 +163,23 @@ impl Engine {
             debug_messenger,
             surface_instance,
             surface,
+
             _physical_device: physical_device,
             device,
+
             _graphics_queue: graphics_queue,
             _present_queue: present_queue,
+
             swapchain_instance,
             swapchain,
             _swapchain_format: image_format,
             _swapchain_extent: extent,
             _swapchain_images: images,
             swapchain_image_views,
+
+            _render_pass: render_pass,
+            pipeline_layout,
+            graphics_pipeline,
         })
     }
 
@@ -616,11 +635,163 @@ impl Engine {
 
         Ok(image_views)
     }
+
+    fn create_render_pass(device: &ash::Device, format: vk::Format)
+        -> Result<vk::RenderPass> {
+        let color_attachment = [vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+
+        let color_attachment_ref = [vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }];
+
+        let subpass = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_attachment_ref)];
+
+        let render_pass_info = vk::RenderPassCreateInfo::default()
+            .attachments(&color_attachment)
+            .subpasses(&subpass);
+
+        let render_pass = unsafe {
+            device
+                .create_render_pass(&render_pass_info, None)
+                .context("Failed to create Render Pass!")?
+        };
+
+        Ok(render_pass)
+    }
+
+    fn create_graphics_pipeline(
+        device: &ash::Device, swapchain_extent: vk::Extent2D, render_pass: vk::RenderPass
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
+        let vert_shader_code = include_spirv!("shaders/shader.vert", vert);
+        let frag_shader_code = include_spirv!("shaders/shader.frag", frag);
+
+        let vert_shader_module = Self::create_shader_module(device, vert_shader_code)?;
+        let frag_shader_module = Self::create_shader_module(device, frag_shader_code)?;
+
+        let main_function_name = CStr::from_bytes_with_nul(b"main\0")?;
+
+        let shader_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert_shader_module)
+                .name(main_function_name),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag_shader_module)
+                .name(main_function_name),
+        ];
+
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .primitive_restart_enable(false);
+
+        let viewport = [vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: WIDTH as f32,
+            height: HEIGHT as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }];
+        let scissor = [vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: swapchain_extent,
+        }];
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(&viewport)
+            .scissors(&scissor);
+
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .depth_clamp_enable(false)
+            .rasterizer_discard_enable(false)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0)
+            .cull_mode(vk::CullModeFlags::BACK)
+            .front_face(vk::FrontFace::CLOCKWISE)
+            .depth_bias_enable(false);
+
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .sample_shading_enable(false)
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        let color_blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                | vk::ColorComponentFlags::G
+                | vk::ColorComponentFlags::B
+                | vk::ColorComponentFlags::A
+            )
+            .blend_enable(false)];
+        let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&color_blend_attachment);
+
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+                .context("Failed to create Pipeline Layout!")?
+        };
+
+        let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input_info)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .color_blend_state(&color_blending)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0)];
+
+        let graphics_pipelines = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_info, None)
+                .map_err(|(_, err)| err)
+                .context("Failed to create Graphics Pipeline!")?
+        };
+
+        unsafe {
+            device.destroy_shader_module(vert_shader_module, None);
+            device.destroy_shader_module(frag_shader_module, None);
+        }
+
+        Ok((pipeline_layout, graphics_pipelines[0]))
+    }
+
+    fn create_shader_module(device: &ash::Device, code: &[u32]) -> Result<vk::ShaderModule> {
+        let create_info = vk::ShaderModuleCreateInfo::default()
+            .code(code);
+
+        let shader_module = unsafe {
+            device
+                .create_shader_module(&create_info, None)
+                .context("Failed to create Shader Module!")?
+        };
+
+        Ok(shader_module)
+    }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_pipeline(self.graphics_pipeline, None);
+            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+
             for &image_view in self.swapchain_image_views.iter() {
                 self.device.destroy_image_view(image_view, None);
             }
