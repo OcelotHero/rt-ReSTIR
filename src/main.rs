@@ -21,7 +21,10 @@ const VALIDATION: ValidationInfo = ValidationInfo {
     enabled: true,
     required_validation_layers: [ "VK_LAYER_KHRONOS_validation" ],
 };
+#[cfg(not(target_os = "macos"))]
 const DEVICE_EXTENSIONS: [&'static str; 1] = [ "VK_KHR_swapchain" ];
+#[cfg(target_os = "macos")]
+const DEVICE_EXTENSIONS: [&'static str; 2] = [ "VK_KHR_swapchain", "VK_KHR_portability_subset" ];
 
 #[derive(Default)]
 struct QueueFamilyIndices {
@@ -180,6 +183,7 @@ impl Engine {
         let mut required_extensions = required_extensions.to_vec();
         #[cfg(target_os = "macos")]
         {
+            required_extensions.push(vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME.as_ptr());
             required_extensions.push(vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr());
         }
         if VALIDATION.enabled {
@@ -624,7 +628,8 @@ impl Drop for Engine {
             self.device.destroy_device(None);
             self.surface_instance.destroy_surface(self.surface, None);
             if VALIDATION.enabled {
-                if let (Some(loader), Some(messenger)) = (&self.debug_utils_instance, &self.debug_messenger) {
+                if let (Some(loader), Some(messenger)) =
+                    (&self.debug_utils_instance, &self.debug_messenger) {
                     loader.destroy_debug_utils_messenger(*messenger, None);
                 }
             }
