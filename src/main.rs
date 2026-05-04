@@ -1,18 +1,18 @@
 extern crate winit;
 
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::dpi::LogicalSize;
+use winit::window::{Window, WindowId};
 
-use ash::{vk, ext, khr};
+use ash::{ext, khr, vk};
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 
 use inline_spirv::include_spirv;
 
@@ -21,12 +21,14 @@ const HEIGHT: u32 = 600;
 
 const VALIDATION: ValidationInfo = ValidationInfo {
     enabled: true,
-    required_validation_layers: [ "VK_LAYER_KHRONOS_validation" ],
+    required_validation_layers: ["VK_LAYER_KHRONOS_validation"],
 };
 #[cfg(not(target_os = "macos"))]
-const DEVICE_EXTENSIONS: [&'static str; 1] = [ "VK_KHR_swapchain" ];
+const DEVICE_EXTENSIONS: [&'static str; 1] = ["VK_KHR_swapchain"];
 #[cfg(target_os = "macos")]
-const DEVICE_EXTENSIONS: [&'static str; 2] = [ "VK_KHR_swapchain", "VK_KHR_portability_subset" ];
+const DEVICE_EXTENSIONS: [&'static str; 2] = ["VK_KHR_swapchain", "VK_KHR_portability_subset"];
+
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 #[derive(Default)]
 struct QueueFamilyIndices {
@@ -91,16 +93,12 @@ fn vk_to_string(raw_string_array: &[c_char]) -> Result<String> {
         .to_owned())
 }
 
-fn populate_debug_messenger_create_info(
-    create_info: &mut vk::DebugUtilsMessengerCreateInfoEXT
-) {
-    create_info.message_severity =
-        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+fn populate_debug_messenger_create_info(create_info: &mut vk::DebugUtilsMessengerCreateInfoEXT) {
+    create_info.message_severity = vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
         // | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
         // | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
         | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR;
-    create_info.message_type =
-        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+    create_info.message_type = vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
         | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
         | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION;
     create_info.pfn_user_callback = Some(debug_callback);
@@ -114,7 +112,7 @@ struct Engine {
     debug_utils_instance: Option<ext::debug_utils::Instance>,
     debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
 
-    _physical_device: vk::PhysicalDevice,
+    physical_device: vk::PhysicalDevice,
     device: ash::Device,
 
     _graphics_queue: vk::Queue,
@@ -122,14 +120,25 @@ struct Engine {
 
     swapchain_instance: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
-    _swapchain_format: vk::Format,
-    _swapchain_extent: vk::Extent2D,
-    _swapchain_images: Vec<vk::Image>,
+    swapchain_format: vk::Format,
+    swapchain_extent: vk::Extent2D,
+    swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+    swapchain_framebuffers: Vec<vk::Framebuffer>,
 
-    _render_pass: vk::RenderPass,
+    render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
+
+    command_pool: vk::CommandPool,
+    command_buffers: Vec<vk::CommandBuffer>,
+
+    image_available_semaphores: Vec<vk::Semaphore>,
+    render_finished_semaphores: Vec<vk::Semaphore>,
+    in_flight_fences: Vec<vk::Fence>,
+    current_frame: usize,
+
+    pub framebuffer_resized: bool,
 }
 
 impl Engine {
@@ -142,19 +151,38 @@ impl Engine {
 
         let physical_device = Self::pick_physical_device(&instance, &surface_instance, &surface)?;
         let (device, family_indices) =
-            Self::create_logical_device(&instance, physical_device, &surface_instance, &surface)?;
-        let graphics_queue =
-            unsafe { device.get_device_queue(family_indices.graphics_family.context("Graphics")?, 0) };
-        let present_queue =
-            unsafe { device.get_device_queue(family_indices.present_family.context("Present")?, 0) };
+            Self::create_logical_device(&instance, &physical_device, &surface_instance, &surface)?;
+        let graphics_queue = unsafe {
+            device.get_device_queue(family_indices.graphics_family.context("Graphics")?, 0)
+        };
+        let present_queue = unsafe {
+            device.get_device_queue(family_indices.present_family.context("Present")?, 0)
+        };
 
-        let (swapchain_instance, swapchain, image_format, extent, images) =
-            Self::create_swapchain(&instance, &device, physical_device, &surface_instance, &surface)?;
-        let swapchain_image_views = Self::create_image_views(&device, image_format, &images)?;
+        let (swapchain_instance, swapchain, swapchain_format, extent, swapchain_images) = Self::create_swapchain(
+            &instance,
+            &device,
+            &physical_device,
+            &surface_instance,
+            &surface,
+        )?;
+        let swapchain_image_views = Self::create_image_views(&device, swapchain_format, &swapchain_images)?;
 
-        let render_pass = Self::create_render_pass(&device, image_format)?;
+        let render_pass = Self::create_render_pass(&device, swapchain_format)?;
         let (pipeline_layout, graphics_pipeline) =
             Self::create_graphics_pipeline(&device, extent, render_pass)?;
+
+        let swapchain_framebuffers =
+            Self::create_framebuffers(&device, extent, render_pass, &swapchain_image_views)?;
+
+        let command_pool = Self::create_command_pool(
+            &device,
+            family_indices.graphics_family.context("Graphics")?,
+        )?;
+        let command_buffers = Self::create_command_buffers(&device, command_pool)?;
+
+        let (image_available_semaphores, render_finished_semaphores, in_flight_fences) =
+            Self::create_sync_objects(&device)?;
 
         Ok(Engine {
             _entry: entry,
@@ -164,7 +192,7 @@ impl Engine {
             surface_instance,
             surface,
 
-            _physical_device: physical_device,
+            physical_device,
             device,
 
             _graphics_queue: graphics_queue,
@@ -172,19 +200,32 @@ impl Engine {
 
             swapchain_instance,
             swapchain,
-            _swapchain_format: image_format,
-            _swapchain_extent: extent,
-            _swapchain_images: images,
+            swapchain_format,
+            swapchain_extent: extent,
+            swapchain_images,
             swapchain_image_views,
+            swapchain_framebuffers,
 
-            _render_pass: render_pass,
+            render_pass,
             pipeline_layout,
             graphics_pipeline,
+
+            command_pool,
+            command_buffers,
+
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+            current_frame: 0,
+
+            framebuffer_resized: false,
         })
     }
 
-    fn create_instance(entry: &ash::Entry, required_extensions: &[*const i8])
-        -> Result<ash::Instance> {
+    fn create_instance(
+        entry: &ash::Entry,
+        required_extensions: &[*const i8],
+    ) -> Result<ash::Instance> {
         ensure!(
             !VALIDATION.enabled || Self::check_validation_layer_support(entry)?,
             "Validation layers requested, but not available!"
@@ -223,13 +264,12 @@ impl Engine {
             .application_info(&app_info)
             .enabled_extension_names(&required_extensions);
 
-        #[cfg(target_os = "macos")] {
-            create_info = create_info
-                .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+        #[cfg(target_os = "macos")]
+        {
+            create_info = create_info.flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
         }
 
-        let mut debug_create_info =
-            vk::DebugUtilsMessengerCreateInfoEXT::default();
+        let mut debug_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default();
         populate_debug_messenger_create_info(&mut debug_create_info);
         if VALIDATION.enabled {
             create_info = create_info
@@ -277,25 +317,33 @@ impl Engine {
         Ok(true)
     }
 
-    fn create_surface(entry: &ash::Entry, instance: &ash::Instance, window: &Window)
-        -> Result<(khr::surface::Instance, vk::SurfaceKHR)> {
+    fn create_surface(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        window: &Window,
+    ) -> Result<(khr::surface::Instance, vk::SurfaceKHR)> {
         let surface = unsafe {
             ash_window::create_surface(
                 entry,
                 instance,
                 window.display_handle()?.as_raw(),
                 window.window_handle()?.as_raw(),
-                None
+                None,
             )
-                .context("Failed to create Surface!")?
+            .context("Failed to create Surface!")?
         };
         let surface_instance = khr::surface::Instance::new(entry, instance);
 
         Ok((surface_instance, surface))
     }
 
-    fn setup_debug_messenger(entry: &ash::Entry, instance: &ash::Instance)
-        -> Result<(Option<ext::debug_utils::Instance>, Option<vk::DebugUtilsMessengerEXT>)> {
+    fn setup_debug_messenger(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+    ) -> Result<(
+        Option<ext::debug_utils::Instance>,
+        Option<vk::DebugUtilsMessengerEXT>,
+    )> {
         if !VALIDATION.enabled {
             return Ok((None, None));
         }
@@ -316,7 +364,7 @@ impl Engine {
     fn pick_physical_device(
         instance: &ash::Instance,
         surface_instance: &khr::surface::Instance,
-        surface: &vk::SurfaceKHR
+        surface: &vk::SurfaceKHR,
     ) -> Result<vk::PhysicalDevice> {
         let physical_devices = unsafe {
             instance
@@ -331,7 +379,7 @@ impl Engine {
 
         let physical_device = 'selection: {
             for device in physical_devices.iter() {
-                if Self::is_device_suitable(instance, *device, surface_instance, surface)? {
+                if Self::is_device_suitable(instance, device, surface_instance, surface)? {
                     break 'selection device;
                 }
             }
@@ -343,11 +391,11 @@ impl Engine {
 
     fn is_device_suitable(
         instance: &ash::Instance,
-        device: vk::PhysicalDevice,
+        device: &vk::PhysicalDevice,
         surface_instance: &khr::surface::Instance,
-        surface: &vk::SurfaceKHR
+        surface: &vk::SurfaceKHR,
     ) -> Result<bool> {
-        let device_properties = unsafe { instance.get_physical_device_properties(device) };
+        let device_properties = unsafe { instance.get_physical_device_properties(*device) };
         let device_name = vk_to_string(&device_properties.device_name)?;
         println!("\tDevice Name: {}", device_name);
 
@@ -363,21 +411,24 @@ impl Engine {
 
     fn find_queue_family(
         instance: &ash::Instance,
-        device: vk::PhysicalDevice,
+        device: &vk::PhysicalDevice,
         surface_instance: &khr::surface::Instance,
-        surface: &vk::SurfaceKHR
+        surface: &vk::SurfaceKHR,
     ) -> Result<QueueFamilyIndices> {
-        let queue_families = unsafe { instance.get_physical_device_queue_family_properties(device) };
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(*device) };
 
         let mut queue_family_indices = QueueFamilyIndices::default();
 
         for (index, queue_family) in queue_families.iter().enumerate() {
-            if queue_family.queue_count > 0 && queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+            if queue_family.queue_count > 0
+                && queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            {
                 queue_family_indices.graphics_family = Some(index as u32);
             }
 
             let present_support = unsafe {
-                surface_instance.get_physical_device_surface_support(device, index as u32, *surface)
+                surface_instance.get_physical_device_surface_support(*device, index as u32, *surface)
             };
             if queue_family.queue_count > 0 && present_support.unwrap_or(false) {
                 queue_family_indices.present_family = Some(index as u32);
@@ -391,11 +442,13 @@ impl Engine {
         Ok(queue_family_indices)
     }
 
-    fn check_device_extension_support(instance: &ash::Instance, device: vk::PhysicalDevice)
-        -> Result<bool> {
+    fn check_device_extension_support(
+        instance: &ash::Instance,
+        device: &vk::PhysicalDevice,
+    ) -> Result<bool> {
         let extension_properties = unsafe {
             instance
-                .enumerate_device_extension_properties(device)
+                .enumerate_device_extension_properties(*device)
                 .context("Failed to enumerate Device Extension Properties!")?
         };
 
@@ -406,7 +459,10 @@ impl Engine {
             println!("Available Device Extensions: ");
             for extension in extension_properties.iter() {
                 let extension_name = vk_to_string(&extension.extension_name)?;
-                println!("\t\tName: {}, Version: {}", extension_name, extension.spec_version);
+                println!(
+                    "\t\tName: {}, Version: {}",
+                    extension_name, extension.spec_version
+                );
             }
         }
 
@@ -424,32 +480,37 @@ impl Engine {
     }
 
     fn query_swapchain_support(
-        physical_device: vk::PhysicalDevice,
+        physical_device: &vk::PhysicalDevice,
         surface_instance: &khr::surface::Instance,
-        surface: &vk::SurfaceKHR
+        surface: &vk::SurfaceKHR,
     ) -> Result<SwapchainSupportDetails> {
         unsafe {
             let capabilities = surface_instance
-                .get_physical_device_surface_capabilities(physical_device, *surface)
+                .get_physical_device_surface_capabilities(*physical_device, *surface)
                 .context("Failed to query Surface Capabilities!")?;
             let formats = surface_instance
-                .get_physical_device_surface_formats(physical_device, *surface)
+                .get_physical_device_surface_formats(*physical_device, *surface)
                 .context("Failed to query Surface Formats!")?;
             let present_modes = surface_instance
-                .get_physical_device_surface_present_modes(physical_device, *surface)
+                .get_physical_device_surface_present_modes(*physical_device, *surface)
                 .context("Failed to query Surface Present Modes!")?;
 
-            Ok(SwapchainSupportDetails { capabilities, formats, present_modes })
+            Ok(SwapchainSupportDetails {
+                capabilities,
+                formats,
+                present_modes,
+            })
         }
     }
 
     fn create_logical_device(
         instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
+        physical_device: &vk::PhysicalDevice,
         surface_instance: &khr::surface::Instance,
-        surface: &vk::SurfaceKHR
+        surface: &vk::SurfaceKHR,
     ) -> Result<(ash::Device, QueueFamilyIndices)> {
-        let indices = Self::find_queue_family(instance, physical_device, surface_instance, surface)?;
+        let indices =
+            Self::find_queue_family(instance, physical_device, surface_instance, surface)?;
 
         let unique_queue_families = [indices.graphics_family, indices.present_family]
             .iter()
@@ -498,7 +559,7 @@ impl Engine {
 
         let device = unsafe {
             instance
-                .create_device(physical_device, &create_info, None)
+                .create_device(*physical_device, &create_info, None)
                 .context("Failed to create Logical Device!")?
         };
 
@@ -508,11 +569,18 @@ impl Engine {
     fn create_swapchain(
         instance: &ash::Instance,
         device: &ash::Device,
-        physical_device: vk::PhysicalDevice,
+        physical_device: &vk::PhysicalDevice,
         surface_instance: &khr::surface::Instance,
-        surface: &vk::SurfaceKHR
-    ) -> Result<(khr::swapchain::Device, vk::SwapchainKHR, vk::Format, vk::Extent2D, Vec<vk::Image>)> {
-        let swapchain_support = Self::query_swapchain_support(physical_device, surface_instance, surface)?;
+        surface: &vk::SurfaceKHR,
+    ) -> Result<(
+        khr::swapchain::Device,
+        vk::SwapchainKHR,
+        vk::Format,
+        vk::Extent2D,
+        Vec<vk::Image>,
+    )> {
+        let swapchain_support =
+            Self::query_swapchain_support(physical_device, surface_instance, surface)?;
 
         let surface_format = Self::choose_swapchain_format(&swapchain_support.formats);
         let present_mode = Self::choose_swapchain_present_mode(&swapchain_support.present_modes);
@@ -525,8 +593,12 @@ impl Engine {
             image_count
         };
 
-        let indices = Self::find_queue_family(instance, physical_device, surface_instance, surface)?;
-        let families = [indices.graphics_family.unwrap(), indices.present_family.unwrap()];
+        let indices =
+            Self::find_queue_family(instance, physical_device, surface_instance, surface)?;
+        let families = [
+            indices.graphics_family.unwrap(),
+            indices.present_family.unwrap(),
+        ];
 
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(*surface)
@@ -560,11 +632,18 @@ impl Engine {
                 .context("Failed to get Swapchain Images!")?
         };
 
-        Ok((swapchain_instance, swapchain, surface_format.format, extent, swapchain_images))
+        Ok((
+            swapchain_instance,
+            swapchain,
+            surface_format.format,
+            extent,
+            swapchain_images,
+        ))
     }
 
-    fn choose_swapchain_format(available_formats: &Vec<vk::SurfaceFormatKHR>)
-        -> vk::SurfaceFormatKHR {
+    fn choose_swapchain_format(
+        available_formats: &Vec<vk::SurfaceFormatKHR>,
+    ) -> vk::SurfaceFormatKHR {
         available_formats
             .iter()
             .find(|format| {
@@ -575,8 +654,9 @@ impl Engine {
             .clone()
     }
 
-    fn choose_swapchain_present_mode(available_present_modes: &Vec<vk::PresentModeKHR>)
-        -> vk::PresentModeKHR {
+    fn choose_swapchain_present_mode(
+        available_present_modes: &Vec<vk::PresentModeKHR>,
+    ) -> vk::PresentModeKHR {
         *available_present_modes
             .iter()
             .find(|&&mode| mode == vk::PresentModeKHR::MAILBOX)
@@ -636,8 +716,7 @@ impl Engine {
         Ok(image_views)
     }
 
-    fn create_render_pass(device: &ash::Device, format: vk::Format)
-        -> Result<vk::RenderPass> {
+    fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass> {
         let color_attachment = [vk::AttachmentDescription::default()
             .format(format)
             .samples(vk::SampleCountFlags::TYPE_1)
@@ -657,9 +736,17 @@ impl Engine {
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_attachment_ref)];
 
+        let dependency = [vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
+
         let render_pass_info = vk::RenderPassCreateInfo::default()
             .attachments(&color_attachment)
-            .subpasses(&subpass);
+            .subpasses(&subpass)
+            .dependencies(&dependency);
 
         let render_pass = unsafe {
             device
@@ -671,7 +758,9 @@ impl Engine {
     }
 
     fn create_graphics_pipeline(
-        device: &ash::Device, swapchain_extent: vk::Extent2D, render_pass: vk::RenderPass
+        device: &ash::Device,
+        swapchain_extent: vk::Extent2D,
+        render_pass: vk::RenderPass,
     ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
         let vert_shader_code = include_spirv!("shaders/shader.vert", vert);
         let frag_shader_code = include_spirv!("shaders/shader.frag", frag);
@@ -709,7 +798,13 @@ impl Engine {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: swapchain_extent,
         }];
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            // .viewport_count(viewport.len() as u32)
+            // .scissor_count(scissor.len() as u32);
             .viewports(&viewport)
             .scissors(&scissor);
 
@@ -729,9 +824,9 @@ impl Engine {
         let color_blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(
                 vk::ColorComponentFlags::R
-                | vk::ColorComponentFlags::G
-                | vk::ColorComponentFlags::B
-                | vk::ColorComponentFlags::A
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
             )
             .blend_enable(false)];
         let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
@@ -753,6 +848,7 @@ impl Engine {
             .rasterization_state(&rasterizer)
             .multisample_state(&multisampling)
             .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state)
             .layout(pipeline_layout)
             .render_pass(render_pass)
             .subpass(0)];
@@ -773,8 +869,7 @@ impl Engine {
     }
 
     fn create_shader_module(device: &ash::Device, code: &[u32]) -> Result<vk::ShaderModule> {
-        let create_info = vk::ShaderModuleCreateInfo::default()
-            .code(code);
+        let create_info = vk::ShaderModuleCreateInfo::default().code(code);
 
         let shader_module = unsafe {
             device
@@ -784,26 +879,353 @@ impl Engine {
 
         Ok(shader_module)
     }
+
+    fn create_framebuffers(
+        device: &ash::Device,
+        extent: vk::Extent2D,
+        render_pass: vk::RenderPass,
+        image_views: &Vec<vk::ImageView>,
+    ) -> Result<Vec<vk::Framebuffer>> {
+        let mut framebuffers = Vec::with_capacity(image_views.len());
+
+        for &image_view in image_views.iter() {
+            let attachments = [image_view];
+            let framebuffer_info = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass)
+                .attachments(&attachments)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+
+            let framebuffer = unsafe {
+                device
+                    .create_framebuffer(&framebuffer_info, None)
+                    .context("Failed to create Framebuffer!")?
+            };
+            framebuffers.push(framebuffer);
+        }
+
+        Ok(framebuffers)
+    }
+
+    fn create_command_pool(
+        device: &ash::Device,
+        graphics_family_index: u32,
+    ) -> Result<vk::CommandPool> {
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(graphics_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+
+        let command_pool = unsafe {
+            device
+                .create_command_pool(&pool_info, None)
+                .context("Failed to create Command Pool!")?
+        };
+
+        Ok(command_pool)
+    }
+
+    fn create_command_buffers(
+        device: &ash::Device,
+        command_pool: vk::CommandPool,
+    ) -> Result<Vec<vk::CommandBuffer>> {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(MAX_FRAMES_IN_FLIGHT as u32);
+
+        let command_buffers = unsafe {
+            device
+                .allocate_command_buffers(&allocate_info)
+                .context("Failed to allocate Command Buffers!")?
+        };
+
+        Ok(command_buffers)
+    }
+
+    fn record_command_buffer(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        image_index: u32,
+    ) -> Result<()> {
+        let begin_info = vk::CommandBufferBeginInfo::default();
+
+        unsafe {
+            self.device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .context("Failed to begin recording Command Buffer!")?;
+
+            let clear_values = [vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 1.0],
+                },
+            }];
+            let render_pass_info = vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(self.swapchain_framebuffers[image_index as usize])
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                })
+                .clear_values(&clear_values);
+
+            self.device.cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_info,
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline,
+            );
+            self.device.cmd_set_viewport(
+                command_buffer,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.swapchain_extent.width as f32,
+                    height: self.swapchain_extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.device.cmd_set_scissor(
+                command_buffer,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain_extent,
+                }],
+            );
+            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(command_buffer);
+
+            self.device
+                .end_command_buffer(command_buffer)
+                .context("Failed to record Command Buffer!")?;
+        }
+
+        Ok(())
+    }
+
+    fn create_sync_objects(
+        device: &ash::Device,
+    ) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>)> {
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+
+        let mut image_available_semaphores = Vec::new();
+        let mut render_finished_semaphores = Vec::new();
+        let mut in_flight_fences = Vec::new();
+
+        for _ in 0..MAX_FRAMES_IN_FLIGHT {
+            unsafe {
+                let image_available_semaphore = device
+                    .create_semaphore(&semaphore_info, None)
+                    .context("Failed to create Image Available Semaphore!")?;
+                let render_finished_semaphore = device
+                    .create_semaphore(&semaphore_info, None)
+                    .context("Failed to create Render Finished Semaphore!")?;
+                let in_flight_fence = device
+                    .create_fence(&fence_info, None)
+                    .context("Failed to create In Flight Fence!")?;
+                image_available_semaphores.push(image_available_semaphore);
+                render_finished_semaphores.push(render_finished_semaphore);
+                in_flight_fences.push(in_flight_fence);
+            };
+        }
+
+        Ok((
+            image_available_semaphores,
+            render_finished_semaphores,
+            in_flight_fences,
+        ))
+    }
+
+    pub fn draw_frame(&mut self) -> Result<()> {
+        unsafe {
+            let wait_fences = [self.in_flight_fences[self.current_frame]];
+            self.device
+                .wait_for_fences(&wait_fences, true, u64::MAX)
+                .context("Failed to wait for In Flight Fence!")?;
+
+            let (image_index, is_suboptimal) = match self.swapchain_instance.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available_semaphores[self.current_frame],
+                vk::Fence::null(),
+            ) {
+                Ok(result) => result,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return self.recreate_swapchain(),
+                Err(err) => return Err(err).context("Failed to acquire next image from Swapchain!"),
+            };
+
+            self.device
+                .reset_fences(&wait_fences)
+                .context("Failed to reset In Flight Fence!")?;
+
+            self.device
+                .reset_command_buffer(
+                    self.command_buffers[self.current_frame],
+                    vk::CommandBufferResetFlags::empty(),
+                )
+                .context("Failed to reset Command Buffer!")?;
+            self.record_command_buffer(self.command_buffers[self.current_frame], image_index)?;
+
+            let wait_semaphores = [self.image_available_semaphores[self.current_frame]];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+
+            let command_buffers = [self.command_buffers[self.current_frame]];
+            let signal_semaphores = [self.render_finished_semaphores[self.current_frame]];
+            let submit_info = [vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores)];
+            self.device
+                .queue_submit(
+                    self._graphics_queue,
+                    &submit_info,
+                    self.in_flight_fences[self.current_frame],
+                )
+                .context("Failed to submit draw command buffer!")?;
+
+            let swapchains = [self.swapchain];
+            let image_indices = [image_index];
+            let changed = match self.swapchain_instance
+                .queue_present(
+                    self._present_queue,
+                    &vk::PresentInfoKHR::default()
+                        .wait_semaphores(&signal_semaphores)
+                        .swapchains(&swapchains)
+                        .image_indices(&image_indices),
+                ) {
+                Ok(suboptimal) => suboptimal || is_suboptimal,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => true,
+                Err(err) => {
+                    return Err(err).context("Failed to present Swapchain image!");
+                }
+            };
+
+            if changed || self.framebuffer_resized {
+                self.framebuffer_resized = false;
+                self.recreate_swapchain()?;
+            }
+
+            self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+        }
+
+        Ok(())
+    }
+
+    fn recreate_swapchain(&mut self) -> Result<()> {
+        unsafe {
+            self.device
+                .device_wait_idle()
+                .context("Failed to wait device idle!")?;
+
+            self.cleanup_swapchain();
+
+            let (
+                swapchain_instance,
+                swapchain,
+                swapchain_format,
+                swapchain_extent,
+                swapchain_images,
+            ) = Self::create_swapchain(
+                &self.instance,
+                &self.device,
+                &self.physical_device,
+                &self.surface_instance,
+                &self.surface,
+            )?;
+            self.swapchain_instance = swapchain_instance;
+            self.swapchain = swapchain;
+            self.swapchain_format = swapchain_format;
+            self.swapchain_extent = swapchain_extent;
+            self.swapchain_images = swapchain_images;
+
+            self.swapchain_image_views = Self::create_image_views(
+                &self.device,
+                self.swapchain_format,
+                &self.swapchain_images,
+            )?;
+
+            self.render_pass = Self::create_render_pass(&self.device, self.swapchain_format)?;
+
+            let (pipeline_layout, graphics_pipeline) = Self::create_graphics_pipeline(
+                &self.device,
+                self.swapchain_extent,
+                self.render_pass,
+            )?;
+            self.pipeline_layout = pipeline_layout;
+            self.graphics_pipeline = graphics_pipeline;
+
+            self.swapchain_framebuffers = Self::create_framebuffers(
+                &self.device,
+                self.swapchain_extent,
+                self.render_pass,
+                &self.swapchain_image_views,
+            )?;
+
+            self.command_buffers = Self::create_command_buffers(&self.device, self.command_pool)?;
+        }
+
+        Ok(())
+    }
+
+    fn cleanup_swapchain(&mut self) {
+        unsafe {
+            self.device.free_command_buffers(self.command_pool, &self.command_buffers);
+
+            for &framebuffer in self.swapchain_framebuffers.iter() {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
+
+            self.device.destroy_pipeline(self.graphics_pipeline, None);
+            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+
+            self.device.destroy_render_pass(self.render_pass, None);
+
+            for &image_view in self.swapchain_image_views.iter() {
+                self.device.destroy_image_view(image_view, None);
+            }
+            self.swapchain_instance
+                .destroy_swapchain(self.swapchain, None);
+        }
+    }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
         unsafe {
-            self.device.destroy_pipeline(self.graphics_pipeline, None);
-            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .device_wait_idle()
+                .expect("Failed to wait device idle!");
 
-            for &image_view in self.swapchain_image_views.iter() {
-                self.device.destroy_image_view(image_view, None);
+            self.cleanup_swapchain();
+
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                self.device
+                    .destroy_semaphore(self.image_available_semaphores[i], None);
+                self.device
+                    .destroy_semaphore(self.render_finished_semaphores[i], None);
+                self.device.destroy_fence(self.in_flight_fences[i], None);
             }
-            self.swapchain_instance.destroy_swapchain(self.swapchain, None);
+
+            self.device.destroy_command_pool(self.command_pool, None);
+
             self.device.destroy_device(None);
-            self.surface_instance.destroy_surface(self.surface, None);
             if VALIDATION.enabled {
                 if let (Some(loader), Some(messenger)) =
-                    (&self.debug_utils_instance, &self.debug_messenger) {
+                    (&self.debug_utils_instance, &self.debug_messenger)
+                {
                     loader.destroy_debug_utils_messenger(*messenger, None);
                 }
             }
+            self.surface_instance.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
     }
@@ -817,6 +1239,8 @@ struct HelloTriangleApplication {
 
 impl ApplicationHandler for HelloTriangleApplication {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() { return; }
+
         let window = event_loop
             .create_window(
                 Window::default_attributes()
@@ -828,7 +1252,10 @@ impl ApplicationHandler for HelloTriangleApplication {
             ash_window::enumerate_required_extensions(window.display_handle().unwrap().as_raw())
                 .expect("Failed to enumerate required extensions for surface creation!");
 
-        self.engine = Some(Engine::new(&window, &required_extensions).expect("Failed to initialize Vulkan Engine!"));
+        self.engine = Some(
+            Engine::new(&window, &required_extensions)
+                .expect("Failed to initialize Vulkan Engine!"),
+        );
         self.window = Some(window);
     }
 
@@ -837,9 +1264,17 @@ impl ApplicationHandler for HelloTriangleApplication {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
-            },
+            }
             WindowEvent::RedrawRequested => {
                 self.window.as_ref().unwrap().request_redraw();
+                self.engine
+                    .as_mut()
+                    .unwrap()
+                    .draw_frame()
+                    .expect("Failed to draw frame!");
+            }
+            WindowEvent::Resized(_size) => {
+                self.engine.as_mut().unwrap().framebuffer_resized = true;
             }
             _ => (),
         }
@@ -847,6 +1282,35 @@ impl ApplicationHandler for HelloTriangleApplication {
 }
 
 fn main() {
+    // If running under WSL, force winit to use X11 (Wayland support on WSL is unreliable).
+    #[cfg(target_os = "linux")]
+    {
+        fn is_wsl() -> bool {
+            if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+                return true;
+            }
+            if let Ok(ver) = std::fs::read_to_string("/proc/version") {
+                let v = ver.to_lowercase();
+                if v.contains("microsoft") || v.contains("wsl") {
+                    return true;
+                }
+            }
+            if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+                let r = release.to_lowercase();
+                if r.contains("microsoft") || r.contains("wsl") {
+                    return true;
+                }
+            }
+            false
+        }
+
+        if is_wsl() {
+            unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
+            unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+            println!("[diagnostic] Detected WSL: forcing WINIT_UNIX_BACKEND=x11 and unsetting WAYLAND_DISPLAY");
+        }
+    }
+
     let event_loop = EventLoop::new().unwrap();
 
     event_loop.set_control_flow(ControlFlow::Poll);
