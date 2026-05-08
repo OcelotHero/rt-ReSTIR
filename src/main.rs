@@ -811,9 +811,12 @@ impl SwapchainBundle {
         let swapchain = unsafe {
             loader.create_swapchain(&create_info, None).context("Failed to create Swapchain!")?
         };
+        let mut cleanup = Defer::new(|| unsafe { loader.destroy_swapchain(swapchain, None) });
+
         let swapchain_images = unsafe {
             loader.get_swapchain_images(swapchain).context("Failed to get Swapchain Images!")?
         };
+        cleanup.0.take();
 
         Ok((swapchain, format.format, extent, swapchain_images))
     }

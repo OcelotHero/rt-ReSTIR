@@ -2,6 +2,10 @@
 name = "rt"
 version = "0.1.1"
 edition = "2024"
+publish = false
+
+[package.metadata.release]
+publish = false
 
 [dependencies]
 num = "0.4.3"
