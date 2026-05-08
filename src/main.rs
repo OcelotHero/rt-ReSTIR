@@ -10,7 +10,7 @@ use winit::window::{Window, WindowId};
 use ash::{ext, khr, vk};
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_void};
+use std::os::raw::c_void;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -23,15 +23,21 @@ const HEIGHT: u32 = 600;
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 struct ValidationInfo {
     enabled: bool,
-    required_validation_layers: [&'static str; 1],
+    required_validation_layers: [&'static CStr; 1],
 }
 const VALIDATION: ValidationInfo =
-    ValidationInfo { enabled: true, required_validation_layers: ["VK_LAYER_KHRONOS_validation"] };
+    ValidationInfo { enabled: true, required_validation_layers: [c"VK_LAYER_KHRONOS_validation"] };
 
 #[cfg(not(target_os = "macos"))]
-const DEVICE_EXTENSIONS: [&'static str; 1] = ["VK_KHR_swapchain"];
+const DEVICE_EXTENSIONS: [&'static CStr; 3] =
+    [c"VK_KHR_swapchain", c"VK_KHR_dynamic_rendering", c"VK_KHR_synchronization2"];
 #[cfg(target_os = "macos")]
-const DEVICE_EXTENSIONS: [&'static str; 2] = ["VK_KHR_swapchain", "VK_KHR_portability_subset"];
+const DEVICE_EXTENSIONS: [&'static CStr; 4] = [
+    c"VK_KHR_swapchain",
+    c"VK_KHR_portability_subset",
+    c"VK_KHR_dynamic_rendering",
+    c"VK_KHR_synchronization2",
+];
 
 #[derive(Default, Clone, Copy)]
 struct QueueFamilyIndices {
@@ -54,6 +60,7 @@ impl QueueFamilyIndices {
         for (index, queue_family) in queue_families.iter().enumerate() {
             if queue_family.queue_count > 0
                 && queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                && queue_family.queue_flags.contains(vk::QueueFlags::COMPUTE)
             {
                 queue_family_indices.graphics_family = Some(index as u32);
             }
@@ -106,15 +113,6 @@ unsafe extern "system" fn debug_callback(
     vk::FALSE
 }
 
-fn vk_to_string(raw_string_array: &[c_char]) -> Result<String> {
-    let raw_string = unsafe {
-        let pointer = raw_string_array.as_ptr();
-        CStr::from_ptr(pointer)
-    };
-
-    Ok(raw_string.to_str().context("Failed to convert vulkan raw string.")?.to_owned())
-}
-
 fn populate_debug_messenger_create_info(create_info: &mut vk::DebugUtilsMessengerCreateInfoEXT) {
     create_info.message_severity = vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
         // | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
@@ -162,6 +160,14 @@ impl VulkanContext {
             "Validation layers requested, but not available!"
         );
 
+        let (major, minor) = match unsafe { entry.try_enumerate_instance_version()? } {
+            // Vulkan 1.1+
+            Some(version) => (vk::api_version_major(version), vk::api_version_minor(version)),
+            // Vulkan 1.0
+            None => (1, 0),
+        };
+        println!("Vulkan {}.{} supported", major, minor);
+
         let app_name = CString::new("Hello Triangle")?;
         let engine_name = CString::new("No Engine")?;
         let app_info = vk::ApplicationInfo::default()
@@ -174,7 +180,7 @@ impl VulkanContext {
             ))
             .engine_name(&engine_name)
             .engine_version(vk::make_api_version(0, 0, 1, 0))
-            .api_version(vk::API_VERSION_1_0);
+            .api_version(vk::make_api_version(0, major, minor, 0));
 
         let mut required_extensions = required_extensions.to_vec();
         #[cfg(target_os = "macos")]
@@ -186,13 +192,11 @@ impl VulkanContext {
             required_extensions.push(vk::EXT_DEBUG_UTILS_NAME.as_ptr());
         }
 
-        let validation_layers_raw: Vec<CString> = VALIDATION
+        let validation_layers: Vec<*const i8> = VALIDATION
             .required_validation_layers
             .iter()
-            .map(|layer_name| CString::new(*layer_name).unwrap())
+            .map(|layer_name| layer_name.as_ptr())
             .collect();
-        let validation_layers: Vec<*const i8> =
-            validation_layers_raw.iter().map(|layer_name| layer_name.as_ptr()).collect();
 
         let mut create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
@@ -233,15 +237,24 @@ impl VulkanContext {
         } else {
             println!("Instance Available Layers: ");
             for layer in layer_properties.iter() {
-                let layer_name = vk_to_string(&layer.layer_name)?;
-                println!("\t{}", layer_name);
+                let layer_name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
+                println!("\t{:?}", layer_name);
             }
         }
 
         'layer: for layer_name in VALIDATION.required_validation_layers.iter() {
             for layer_property in layer_properties.iter() {
-                let test_layer_name = vk_to_string(&layer_property.layer_name)?;
+                let test_layer_name =
+                    unsafe { CStr::from_ptr(layer_property.layer_name.as_ptr()) };
                 if (*layer_name) == test_layer_name {
+                    let api_version = layer_property.spec_version;
+                    let major = vk::api_version_major(api_version);
+                    let minor = vk::api_version_minor(api_version);
+                    let patch = vk::api_version_patch(api_version);
+                    println!(
+                        "Validation layer {:?} is supported with version {}.{}.{}",
+                        layer_name, major, minor, patch
+                    );
                     continue 'layer;
                 }
             }
@@ -308,6 +321,8 @@ impl Drop for VulkanContext {
 
 struct DeviceContext {
     vk_ctx: Arc<VulkanContext>,
+    dyn_render: khr::dynamic_rendering::Device,
+    sync2: khr::synchronization2::Device,
     handle: ash::Device,
     device: vk::PhysicalDevice,
     indices: QueueFamilyIndices,
@@ -322,11 +337,14 @@ impl DeviceContext {
         let surface = &vk_ctx.surface;
 
         let (indices, device) = Self::pick_physical_device(instance, surface_loader, surface)?;
+        let handle = Self::create_logical_device(instance, &device, &indices)?;
         let mut device = Self {
             vk_ctx: vk_ctx.clone(),
             device,
             indices,
-            handle: Self::create_logical_device(instance, &device, &indices)?,
+            dyn_render: khr::dynamic_rendering::Device::new(instance, &handle),
+            sync2: khr::synchronization2::Device::new(instance, &handle),
+            handle,
             graphics_queue: vk::Queue::null(),
             present_queue: vk::Queue::null(),
         };
@@ -373,8 +391,12 @@ impl DeviceContext {
         surface: &vk::SurfaceKHR,
     ) -> Result<(QueueFamilyIndices, bool)> {
         let device_properties = unsafe { instance.get_physical_device_properties(*device) };
-        let device_name = vk_to_string(&device_properties.device_name)?;
-        println!("\tDevice Name: {}", device_name);
+        let device_name = unsafe { CStr::from_ptr(device_properties.device_name.as_ptr()) };
+        let api_version = device_properties.api_version;
+        let major = vk::api_version_major(api_version);
+        let minor = vk::api_version_minor(api_version);
+        let patch = vk::api_version_patch(api_version);
+        println!("\tDevice Name: {:?}, Version: {}.{}.{}", device_name, major, minor, patch);
 
         let indices =
             QueueFamilyIndices::find_queue_family(instance, device, surface_loader, surface)?;
@@ -385,7 +407,28 @@ impl DeviceContext {
             !formats.is_empty() && !present_modes.is_empty()
         };
 
-        Ok((indices, indices.is_complete() && extensions_supported && swapchain_adequate))
+        let mut dyn_render_features = vk::PhysicalDeviceDynamicRenderingFeaturesKHR::default();
+        let mut sync2_features = vk::PhysicalDeviceSynchronization2FeaturesKHR::default();
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut features2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut features13)
+            .push_next(&mut dyn_render_features)
+            .push_next(&mut sync2_features);
+        unsafe { instance.get_physical_device_features2(*device, &mut features2) };
+
+        let has_dyn_render = features13.dynamic_rendering == vk::TRUE
+            || dyn_render_features.dynamic_rendering == vk::TRUE;
+        let has_sync2 =
+            features13.synchronization2 == vk::TRUE || sync2_features.synchronization2 == vk::TRUE;
+        let dyn_render_supported = has_dyn_render && has_sync2;
+
+        Ok((
+            indices,
+            indices.is_complete()
+                && extensions_supported
+                && swapchain_adequate
+                && dyn_render_supported,
+        ))
     }
 
     fn check_device_extension_support(
@@ -404,14 +447,14 @@ impl DeviceContext {
         } else {
             println!("Available Device Extensions: ");
             for extension in extension_properties.iter() {
-                let extension_name = vk_to_string(&extension.extension_name)?;
-                println!("\t\tName: {}, Version: {}", extension_name, extension.spec_version);
+                let extension_name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
+                println!("\t\tName: {:?}, Version: {}", extension_name, extension.spec_version);
             }
         }
 
         'extension: for required_extension in DEVICE_EXTENSIONS.iter() {
             for extension in extension_properties.iter() {
-                let extension_name = vk_to_string(&extension.extension_name)?;
+                let extension_name = unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) };
                 if (*required_extension) == extension_name {
                     continue 'extension;
                 }
@@ -442,29 +485,18 @@ impl DeviceContext {
             })
             .collect::<Vec<_>>();
 
-        let device_features = vk::PhysicalDeviceFeatures::default();
-
-        let device_extensions_raw: Vec<CString> =
-            DEVICE_EXTENSIONS.iter().map(|ext_name| CString::new(*ext_name).unwrap()).collect();
         let device_extensions: Vec<*const i8> =
-            device_extensions_raw.iter().map(|ext_name| ext_name.as_ptr()).collect();
+            DEVICE_EXTENSIONS.iter().map(|ext_name| ext_name.as_ptr()).collect();
 
-        let mut create_info = vk::DeviceCreateInfo::default()
+        let mut dyn_render_feature =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut sync2_feature =
+            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let create_info = vk::DeviceCreateInfo::default()
+            .push_next(&mut dyn_render_feature)
+            .push_next(&mut sync2_feature)
             .queue_create_infos(&queue_create_infos)
-            .enabled_features(&device_features)
             .enabled_extension_names(&device_extensions);
-
-        let validation_layers_raw: Vec<CString> = VALIDATION
-            .required_validation_layers
-            .iter()
-            .map(|layer_name| CString::new(*layer_name).unwrap())
-            .collect();
-        let validation_layers: Vec<*const i8> =
-            validation_layers_raw.iter().map(|layer_name| layer_name.as_ptr()).collect();
-
-        if VALIDATION.enabled {
-            create_info = create_info.enabled_layer_names(&validation_layers);
-        }
 
         let device = unsafe {
             instance
@@ -503,7 +535,6 @@ impl<F: FnOnce()> Drop for Defer<F> {
 
 struct PipelineBundle {
     dev_ctx: Arc<DeviceContext>,
-    render_pass: vk::RenderPass,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
 }
@@ -521,56 +552,12 @@ impl PipelineBundle {
 
         let mut bundle = Self {
             dev_ctx: dev_ctx.clone(),
-            render_pass: Self::create_render_pass(handle, format)?,
-            layout: vk::PipelineLayout::null(),
+            layout: Self::create_pipeline_layout(handle)?,
             pipeline: vk::Pipeline::null(),
         };
-        bundle.layout = Self::create_pipeline_layout(handle)?;
-        bundle.pipeline =
-            Self::create_graphics_pipeline(handle, &bundle.render_pass, &bundle.layout)?;
+        bundle.pipeline = Self::create_graphics_pipeline(handle, &bundle.layout, &format)?;
 
         Ok(bundle)
-    }
-
-    fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass> {
-        let color_attachment = [vk::AttachmentDescription::default()
-            .format(format)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
-
-        let color_attachment_ref = [vk::AttachmentReference {
-            attachment: 0,
-            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        }];
-
-        let subpass = [vk::SubpassDescription::default()
-            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&color_attachment_ref)];
-
-        let dependency = [vk::SubpassDependency::default()
-            .src_subpass(vk::SUBPASS_EXTERNAL)
-            .dst_subpass(0)
-            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
-
-        let render_pass_info = vk::RenderPassCreateInfo::default()
-            .attachments(&color_attachment)
-            .subpasses(&subpass)
-            .dependencies(&dependency);
-
-        let render_pass = unsafe {
-            device
-                .create_render_pass(&render_pass_info, None)
-                .context("Failed to create Render Pass!")?
-        };
-
-        Ok(render_pass)
     }
 
     fn create_pipeline_layout(device: &ash::Device) -> Result<vk::PipelineLayout> {
@@ -587,8 +574,8 @@ impl PipelineBundle {
 
     fn create_graphics_pipeline(
         device: &ash::Device,
-        render_pass: &vk::RenderPass,
         pipeline_layout: &vk::PipelineLayout,
+        format: &vk::Format,
     ) -> Result<vk::Pipeline> {
         let vert_code = include_spirv!("shaders/shader.vert", vert);
         let frag_code = include_spirv!("shaders/shader.frag", frag);
@@ -600,17 +587,17 @@ impl PipelineBundle {
         let _frag_defer =
             Defer::new(|| unsafe { device.destroy_shader_module(frag_module, None) });
 
-        let main_function_name = CStr::from_bytes_with_nul(b"main\0")?;
+        let main_function_name = CString::new("main")?;
 
         let shader_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(vert_module)
-                .name(main_function_name),
+                .name(&main_function_name),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag_module)
-                .name(main_function_name),
+                .name(&main_function_name),
         ];
 
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
@@ -639,16 +626,15 @@ impl PipelineBundle {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
         let color_blend_attachment = [vk::PipelineColorBlendAttachmentState::default()
-            .color_write_mask(
-                vk::ColorComponentFlags::R
-                    | vk::ColorComponentFlags::G
-                    | vk::ColorComponentFlags::B
-                    | vk::ColorComponentFlags::A,
-            )
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
             .blend_enable(false)];
         let color_blending = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(&color_blend_attachment);
+
+        let formats = [*format];
+        let mut rendering =
+            vk::PipelineRenderingCreateInfoKHR::default().color_attachment_formats(&formats);
 
         let pipeline_info = [vk::GraphicsPipelineCreateInfo::default()
             .stages(&shader_stages)
@@ -660,8 +646,7 @@ impl PipelineBundle {
             .color_blend_state(&color_blending)
             .dynamic_state(&dynamic_state)
             .layout(*pipeline_layout)
-            .render_pass(*render_pass)
-            .subpass(0)];
+            .push_next(&mut rendering)];
 
         let graphics_pipelines = unsafe {
             device
@@ -689,13 +674,10 @@ impl PipelineBundle {
 impl Drop for PipelineBundle {
     fn drop(&mut self) {
         unsafe {
-            self.dev_ctx.handle.destroy_pipeline(self.pipeline, None);
-            if self.layout != vk::PipelineLayout::null() {
-                self.dev_ctx.handle.destroy_pipeline_layout(self.layout, None);
+            if self.pipeline != vk::Pipeline::null() {
+                self.dev_ctx.handle.destroy_pipeline(self.pipeline, None);
             }
-            if self.render_pass != vk::RenderPass::null() {
-                self.dev_ctx.handle.destroy_render_pass(self.render_pass, None);
-            }
+            self.dev_ctx.handle.destroy_pipeline_layout(self.layout, None);
         }
     }
 }
@@ -707,11 +689,11 @@ struct SwapchainBundle {
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
-    framebuffers: Vec<vk::Framebuffer>,
 }
 
 impl SwapchainBundle {
-    fn new(dev_ctx: Arc<DeviceContext>, render_pass: &vk::RenderPass) -> Result<Self> {
+    // fn new(dev_ctx: Arc<DeviceContext>, render_pass: &vk::RenderPass) -> Result<Self> {
+    fn new(dev_ctx: Arc<DeviceContext>) -> Result<Self> {
         let physical_device = &dev_ctx.device;
         let device = &dev_ctx.handle;
         let indices = &dev_ctx.indices;
@@ -731,15 +713,8 @@ impl SwapchainBundle {
             extent,
             images,
             image_views: Vec::new(),
-            framebuffers: Vec::new(),
         };
         bundle.image_views = Self::create_image_views(&device, &format, &bundle.images)?;
-        bundle.framebuffers = Self::create_framebuffers(
-            &bundle.dev_ctx.handle,
-            &bundle.extent,
-            render_pass,
-            &bundle.image_views,
-        )?;
 
         Ok(bundle)
     }
@@ -895,42 +870,11 @@ impl SwapchainBundle {
 
         Ok(image_views)
     }
-
-    fn create_framebuffers(
-        device: &ash::Device,
-        extent: &vk::Extent2D,
-        render_pass: &vk::RenderPass,
-        image_views: &Vec<vk::ImageView>,
-    ) -> Result<Vec<vk::Framebuffer>> {
-        let mut framebuffers = Vec::with_capacity(image_views.len());
-
-        for &image_view in image_views.iter() {
-            let attachments = [image_view];
-            let framebuffer_info = vk::FramebufferCreateInfo::default()
-                .render_pass(*render_pass)
-                .attachments(&attachments)
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
-
-            let framebuffer = unsafe {
-                device
-                    .create_framebuffer(&framebuffer_info, None)
-                    .context("Failed to create Framebuffer!")?
-            };
-            framebuffers.push(framebuffer);
-        }
-
-        Ok(framebuffers)
-    }
 }
 
 impl Drop for SwapchainBundle {
     fn drop(&mut self) {
         unsafe {
-            for &framebuffer in self.framebuffers.iter() {
-                self.dev_ctx.handle.destroy_framebuffer(framebuffer, None);
-            }
             for &image_view in self.image_views.iter() {
                 self.dev_ctx.handle.destroy_image_view(image_view, None);
             }
@@ -1106,7 +1050,7 @@ impl Engine {
         let vk_ctx = Arc::new(VulkanContext::init(window, required_extensions)?);
         let dev_ctx = Arc::new(DeviceContext::init(vk_ctx.clone())?);
         let pipeline = PipelineBundle::new(dev_ctx.clone())?;
-        let swapchain = SwapchainBundle::new(dev_ctx.clone(), &pipeline.render_pass)?;
+        let swapchain = SwapchainBundle::new(dev_ctx.clone())?;
         let command = CommandBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
         let sync = SyncBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
 
@@ -1198,30 +1142,54 @@ impl Engine {
         unsafe {
             self.dev_ctx.handle.device_wait_idle().context("Failed to wait device idle!")?;
         }
-        self.swapchain = SwapchainBundle::new(self.dev_ctx.clone(), &self.pipeline.render_pass)?;
+        // self.swapchain = SwapchainBundle::new(self.dev_ctx.clone(), &self.pipeline.render_pass)?;
+        self.swapchain = SwapchainBundle::new(self.dev_ctx.clone())?;
 
         Ok(())
     }
 
     fn record_command(&self, image_index: u32) -> Result<vk::CommandBuffer> {
         let cmd = self.command.begin_recording(self.current_frame)?;
-        let clear_values =
-            [vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } }];
-        let render_pass_info = vk::RenderPassBeginInfo::default()
-            .render_pass(self.pipeline.render_pass)
-            .framebuffer(self.swapchain.framebuffers[image_index as usize])
+
+        let color_attachment_info = [vk::RenderingAttachmentInfo::default()
+            .image_view(self.swapchain.image_views[image_index as usize])
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
+            })];
+
+        let render_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: self.swapchain.extent,
             })
-            .clear_values(&clear_values);
+            .layer_count(1)
+            // .view_mask(0)
+            .color_attachments(&color_attachment_info);
 
         unsafe {
-            self.dev_ctx.handle.cmd_begin_render_pass(
-                cmd,
-                &render_pass_info,
-                vk::SubpassContents::INLINE,
-            );
+            let image_memory_barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_READ)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .image(self.swapchain.images[image_index as usize])
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            let dependency_info =
+                vk::DependencyInfo::default().image_memory_barriers(&image_memory_barrier);
+            self.dev_ctx.sync2.cmd_pipeline_barrier2(cmd, &dependency_info);
+
+            self.dev_ctx.dyn_render.cmd_begin_rendering(cmd, &render_info);
             self.dev_ctx.handle.cmd_bind_pipeline(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -1248,8 +1216,26 @@ impl Engine {
                 }],
             );
             self.dev_ctx.handle.cmd_draw(cmd, 3, 1, 0, 0);
-            self.dev_ctx.handle.cmd_end_render_pass(cmd);
+            self.dev_ctx.dyn_render.cmd_end_rendering(cmd);
 
+            let image_memory_barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                .old_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(vk::AccessFlags2::empty())
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .image(self.swapchain.images[image_index as usize])
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+            let dependency_info =
+                vk::DependencyInfo::default().image_memory_barriers(&image_memory_barrier);
+            self.dev_ctx.sync2.cmd_pipeline_barrier2(cmd, &dependency_info);
             self.command.end_recording(cmd)
         }
     }
@@ -1305,23 +1291,27 @@ impl ApplicationHandler for HelloTriangleApplication {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some((engine, window)) = self.state.as_mut() else { return };
+        let Some((engine, _)) = self.state.as_mut() else { return };
 
         match event {
             WindowEvent::CloseRequested => {
                 println!("The close button was pressed; stopping");
                 event_loop.exit();
             }
-            WindowEvent::RedrawRequested => {
-                window.request_redraw();
-                if let Err(e) = engine.draw_frame() {
-                    eprintln!("Failed to draw frame: {}", e);
-                }
-            }
             WindowEvent::Resized(_size) => {
                 engine.framebuffer_resized = true;
             }
             _ => (),
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        let Some((engine, _)) = self.state.as_mut() else { return };
+
+        if engine.framebuffer_resized {
+            if let Err(e) = engine.draw_frame() {
+                eprintln!("Failed to draw frame: {}", e);
+            }
         }
     }
 }
