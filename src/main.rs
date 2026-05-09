@@ -134,7 +134,7 @@ struct VulkanContext {
 
 impl VulkanContext {
     pub fn init(window: &Window, required_extensions: &[*const i8]) -> Result<Self> {
-        let entry = ash::Entry::linked();
+        let entry = unsafe{ash::Entry::load()?};
         let instance = Self::create_instance(&entry, required_extensions)?;
         let surface_loader = khr::surface::Instance::new(&entry, &instance);
 
