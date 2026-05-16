@@ -10,6 +10,7 @@ use winit::window::{Window, WindowId};
 use ash::{ext, khr, vk};
 
 use std::ffi::{CStr, CString};
+use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
 use std::sync::Arc;
 
@@ -38,6 +39,46 @@ const DEVICE_EXTENSIONS: [&'static CStr; 4] = [
     c"VK_KHR_dynamic_rendering",
     c"VK_KHR_synchronization2",
 ];
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Vertex {
+    pos: [f32; 2],
+    color: [f32; 3],
+}
+
+impl Vertex {
+    pub fn get_binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(size_of::<Self>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)
+    }
+
+    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(Self, pos) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(offset_of!(Self, color) as u32),
+        ]
+    }
+}
+
+const VERTICES: [Vertex; 4] = [
+    Vertex { pos: [-0.5, -0.5], color: [1.0, 0.0, 0.0] },
+    Vertex { pos: [0.5, -0.5], color: [0.0, 1.0, 0.0] },
+    Vertex { pos: [0.5, 0.5], color: [0.0, 0.0, 1.0] },
+    Vertex { pos: [-0.5, 0.5], color: [1.0, 1.0, 1.0] },
+];
+
+const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
 #[derive(Default, Clone, Copy)]
 struct QueueFamilyIndices {
@@ -311,9 +352,7 @@ impl Drop for VulkanContext {
             if let Some((loader, messenger)) = self.debug_utils.take() {
                 loader.destroy_debug_utils_messenger(messenger, None);
             }
-            if self.surface != vk::SurfaceKHR::null() {
-                self.surface_loader.destroy_surface(self.surface, None);
-            }
+            self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
     }
@@ -600,7 +639,11 @@ impl PipelineBundle {
                 .name(&main_function_name),
         ];
 
-        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+        let binding_description = [Vertex::get_binding_description()];
+        let attribute_descriptions = Vertex::get_attribute_descriptions();
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&binding_description)
+            .vertex_attribute_descriptions(&attribute_descriptions);
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .primitive_restart_enable(false);
@@ -674,9 +717,7 @@ impl PipelineBundle {
 impl Drop for PipelineBundle {
     fn drop(&mut self) {
         unsafe {
-            if self.pipeline != vk::Pipeline::null() {
-                self.dev_ctx.handle.destroy_pipeline(self.pipeline, None);
-            }
+            self.dev_ctx.handle.destroy_pipeline(self.pipeline, None);
             self.dev_ctx.handle.destroy_pipeline_layout(self.layout, None);
         }
     }
@@ -692,7 +733,6 @@ struct SwapchainBundle {
 }
 
 impl SwapchainBundle {
-    // fn new(dev_ctx: Arc<DeviceContext>, render_pass: &vk::RenderPass) -> Result<Self> {
     fn new(dev_ctx: Arc<DeviceContext>) -> Result<Self> {
         let physical_device = &dev_ctx.device;
         let device = &dev_ctx.handle;
@@ -945,10 +985,6 @@ impl CommandBundle {
         unsafe {
             self.dev_ctx
                 .handle
-                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                .context("Failed to reset Command Buffer!")?;
-            self.dev_ctx
-                .handle
                 .begin_command_buffer(cmd, &begin_info)
                 .context("Failed to begin recording Command Buffer!")?;
         }
@@ -962,6 +998,51 @@ impl CommandBundle {
         }
 
         Ok(cmd)
+    }
+
+    pub fn copy_buffer(
+        &self,
+        queue: vk::Queue,
+        src: &BufferBundle,
+        dst: &BufferBundle,
+        size: vk::DeviceSize,
+    ) -> Result<()> {
+        let device = &self.dev_ctx.handle;
+
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = unsafe {
+            device
+                .allocate_command_buffers(&alloc_info)
+                .context("Failed to allocate Command Buffer!")?
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            device
+                .begin_command_buffer(cmd[0], &begin_info)
+                .context("Failed to begin recording Command Buffer!")?;
+
+            let copy_region = vk::BufferCopy::default().size(size);
+            device.cmd_copy_buffer(cmd[0], src.buffer, dst.buffer, &[copy_region]);
+
+            device
+                .end_command_buffer(cmd[0])
+                .context("Failed to end recording Command Buffer!")?;
+
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cmd);
+            device.queue_submit(queue, &[submit_info], vk::Fence::null())?;
+
+            // Block CPU until execution finishes
+            device.queue_wait_idle(queue)?;
+            device.free_command_buffers(self.pool, &cmd);
+        }
+
+        Ok(())
     }
 }
 
@@ -1035,12 +1116,106 @@ impl Drop for SyncBundle {
     }
 }
 
+struct BufferBundle {
+    dev_ctx: Arc<DeviceContext>,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    size: vk::DeviceSize,
+}
+
+impl BufferBundle {
+    pub fn new(
+        dev_ctx: Arc<DeviceContext>,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        properties: vk::MemoryPropertyFlags,
+    ) -> Result<Self> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let mut bundle = Self {
+            dev_ctx: dev_ctx.clone(),
+            buffer: unsafe { dev_ctx.handle.create_buffer(&buffer_info, None)? },
+            memory: vk::DeviceMemory::null(),
+            size,
+        };
+
+        let mem_requirements =
+            unsafe { dev_ctx.handle.get_buffer_memory_requirements(bundle.buffer) };
+        let mem_type = Self::find_memory_type(
+            &dev_ctx.vk_ctx.instance,
+            &dev_ctx.device,
+            mem_requirements.memory_type_bits,
+            &properties,
+        )?;
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_requirements.size)
+            .memory_type_index(mem_type);
+        bundle.memory = unsafe { dev_ctx.handle.allocate_memory(&alloc_info, None)? };
+
+        unsafe { dev_ctx.handle.bind_buffer_memory(bundle.buffer, bundle.memory, 0)? };
+
+        Ok(bundle)
+    }
+
+    fn find_memory_type(
+        instance: &ash::Instance,
+        physical_device: &vk::PhysicalDevice,
+        type_filter: u32,
+        properties: &vk::MemoryPropertyFlags,
+    ) -> Result<u32> {
+        let mem_properties =
+            unsafe { instance.get_physical_device_memory_properties(*physical_device) };
+
+        for (i, mem_type) in mem_properties.memory_types.iter().enumerate() {
+            if (type_filter & (1 << i)) != 0 && mem_type.property_flags.contains(*properties) {
+                return Ok(i as u32);
+            }
+        }
+
+        bail!("Failed to find suitable memory type!")
+    }
+
+    pub fn fill_buffer<T: Copy>(&self, data: &[T]) -> Result<()> {
+        let size = (size_of::<T>() * data.len()) as vk::DeviceSize;
+        ensure!(size <= self.size, "Data size exceeds buffer capacity!");
+
+        unsafe {
+            let data_ptr = self.dev_ctx.handle.map_memory(
+                self.memory,
+                0,
+                size,
+                vk::MemoryMapFlags::empty(),
+            )?;
+
+            std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr as *mut T, data.len());
+
+            self.dev_ctx.handle.unmap_memory(self.memory);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BufferBundle {
+    fn drop(&mut self) {
+        unsafe {
+            self.dev_ctx.handle.destroy_buffer(self.buffer, None);
+            self.dev_ctx.handle.free_memory(self.memory, None);
+        }
+    }
+}
+
 struct Engine {
     dev_ctx: Arc<DeviceContext>,
     pipeline: PipelineBundle,
     swapchain: SwapchainBundle,
     command: CommandBundle,
     sync: SyncBundle,
+    i_buffer: BufferBundle,
+    v_buffer: BufferBundle,
     current_frame: usize,
     pub framebuffer_resized: bool,
 }
@@ -1054,12 +1229,60 @@ impl Engine {
         let command = CommandBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
         let sync = SyncBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
 
+        // Create staging buffer and fill vertex data
+        let s_buffer = BufferBundle::new(
+            dev_ctx.clone(),
+            (size_of::<Vertex>() * VERTICES.len()) as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        s_buffer.fill_buffer(&VERTICES)?;
+
+        let v_buffer = BufferBundle::new(
+            dev_ctx.clone(),
+            (size_of::<Vertex>() * VERTICES.len()) as vk::DeviceSize,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        CommandBundle::copy_buffer(
+            &command,
+            dev_ctx.graphics_queue,
+            &s_buffer,
+            &v_buffer,
+            s_buffer.size,
+        )?;
+
+        // Create staging buffer and fill index data
+        let s_buffer = BufferBundle::new(
+            dev_ctx.clone(),
+            (size_of::<u16>() * INDICES.len()) as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        s_buffer.fill_buffer(&INDICES)?;
+
+        let i_buffer = BufferBundle::new(
+            dev_ctx.clone(),
+            (size_of::<u16>() * INDICES.len()) as vk::DeviceSize,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        CommandBundle::copy_buffer(
+            &command,
+            dev_ctx.graphics_queue,
+            &s_buffer,
+            &i_buffer,
+            s_buffer.size,
+        )?;
+
         Ok(Engine {
             dev_ctx,
             pipeline,
             swapchain,
             command,
             sync,
+            v_buffer,
+            i_buffer,
             current_frame: 0,
             framebuffer_resized: false,
         })
@@ -1142,7 +1365,6 @@ impl Engine {
         unsafe {
             self.dev_ctx.handle.device_wait_idle().context("Failed to wait device idle!")?;
         }
-        // self.swapchain = SwapchainBundle::new(self.dev_ctx.clone(), &self.pipeline.render_pass)?;
         self.swapchain = SwapchainBundle::new(self.dev_ctx.clone())?;
 
         Ok(())
@@ -1166,7 +1388,6 @@ impl Engine {
                 extent: self.swapchain.extent,
             })
             .layer_count(1)
-            // .view_mask(0)
             .color_attachments(&color_attachment_info);
 
         unsafe {
@@ -1215,7 +1436,14 @@ impl Engine {
                     extent: self.swapchain.extent,
                 }],
             );
-            self.dev_ctx.handle.cmd_draw(cmd, 3, 1, 0, 0);
+            self.dev_ctx.handle.cmd_bind_vertex_buffers(cmd, 0, &[self.v_buffer.buffer], &[0]);
+            self.dev_ctx.handle.cmd_bind_index_buffer(
+                cmd,
+                self.i_buffer.buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
+            self.dev_ctx.handle.cmd_draw_indexed(cmd, INDICES.len() as u32, 1, 0, 0, 0);
             self.dev_ctx.dyn_render.cmd_end_rendering(cmd);
 
             let image_memory_barrier = [vk::ImageMemoryBarrier2::default()
@@ -1342,9 +1570,8 @@ fn main() {
         if is_wsl() {
             unsafe { std::env::set_var("WINIT_UNIX_BACKEND", "x11") };
             unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
-            println!(
-                "[diagnostic] Detected WSL: forcing WINIT_UNIX_BACKEND=x11 and unsetting WAYLAND_DISPLAY"
-            );
+            print!("[diagnostic] Detected WSL: forcing WINIT_UNIX_BACKEND=x11 ");
+            println!("and unsetting WAYLAND_DISPLAY");
         }
     }
 
