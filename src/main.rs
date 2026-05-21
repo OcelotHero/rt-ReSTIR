@@ -587,13 +587,10 @@ struct PipelineBundle {
     dev_ctx: Arc<DeviceContext>,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    ubo_layout: vk::DescriptorSetLayout,
-    ubo_pool: vk::DescriptorPool,
-    ubo_sets: Vec<vk::DescriptorSet>,
 }
 
 impl PipelineBundle {
-    pub fn new(dev_ctx: Arc<DeviceContext>, size: usize) -> Result<Self> {
+    pub fn new(dev_ctx: Arc<DeviceContext>, ubo_layout: &vk::DescriptorSetLayout) -> Result<Self> {
         let handle = &dev_ctx.handle;
         let device = &dev_ctx.device;
         let surface_loader = &dev_ctx.vk_ctx.surface_loader;
@@ -607,81 +604,11 @@ impl PipelineBundle {
             dev_ctx: dev_ctx.clone(),
             layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
-            ubo_layout: Self::create_ubo_layout(handle)?,
-            ubo_pool: vk::DescriptorPool::null(),
-            ubo_sets: Vec::new(),
         };
-        bundle.ubo_pool = Self::create_descriptor_pool(handle, size)?;
-        bundle.ubo_sets =
-            Self::create_descriptor_sets(handle, &bundle.ubo_pool, &bundle.ubo_layout, size)?;
-        bundle.layout = Self::create_pipeline_layout(handle, &bundle.ubo_layout)?;
+        bundle.layout = Self::create_pipeline_layout(handle, ubo_layout)?;
         bundle.pipeline = Self::create_graphics_pipeline(handle, &bundle.layout, &format)?;
 
         Ok(bundle)
-    }
-
-    fn create_ubo_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-        let ubo_binding = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_binding);
-
-        let layout = unsafe {
-            device
-                .create_descriptor_set_layout(&layout_info, None)
-                .context("Failed to create Descriptor Set Layout!")?
-        };
-
-        Ok(layout)
-    }
-
-    fn create_descriptor_pool(device: &ash::Device, size: usize) -> Result<vk::DescriptorPool> {
-        let pool_size = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(size as u32)];
-        let pool_info =
-            vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_size).max_sets(size as u32);
-
-        let pool = unsafe {
-            device
-                .create_descriptor_pool(&pool_info, None)
-                .context("Failed to create Descriptor Pool!")?
-        };
-
-        Ok(pool)
-    }
-
-    fn create_descriptor_sets(
-        device: &ash::Device,
-        pool: &vk::DescriptorPool,
-        layout: &vk::DescriptorSetLayout,
-        size: usize,
-    ) -> Result<Vec<vk::DescriptorSet>> {
-        let layouts = vec![*layout; size];
-        let alloc_info =
-            vk::DescriptorSetAllocateInfo::default().descriptor_pool(*pool).set_layouts(&layouts);
-
-        let descriptor_sets = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc_info)
-                .context("Failed to allocate Descriptor Sets!")?
-        };
-
-        Ok(descriptor_sets)
-    }
-
-    fn update_descriptor_set(&self, idx: usize, buffer: &vk::Buffer) {
-        let buffer_info =
-            [vk::DescriptorBufferInfo::default().buffer(*buffer).offset(0).range(vk::WHOLE_SIZE)];
-        let descriptor_write = [vk::WriteDescriptorSet::default()
-            .dst_set(self.ubo_sets[idx])
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(&buffer_info)];
-
-        unsafe { self.dev_ctx.handle.update_descriptor_sets(&descriptor_write, &[]) };
     }
 
     fn create_pipeline_layout(
@@ -807,8 +734,6 @@ impl PipelineBundle {
 impl Drop for PipelineBundle {
     fn drop(&mut self) {
         unsafe {
-            self.dev_ctx.handle.destroy_descriptor_pool(self.ubo_pool, None);
-            self.dev_ctx.handle.destroy_descriptor_set_layout(self.ubo_layout, None);
             self.dev_ctx.handle.destroy_pipeline(self.pipeline, None);
             self.dev_ctx.handle.destroy_pipeline_layout(self.layout, None);
         }
@@ -1070,31 +995,6 @@ impl CommandBundle {
         Ok(command_buffers)
     }
 
-    pub fn begin_recording(&self, index: usize) -> Result<vk::CommandBuffer> {
-        let cmd = self.buffers[index];
-        let begin_info = vk::CommandBufferBeginInfo::default();
-
-        unsafe {
-            self.dev_ctx
-                .handle
-                .begin_command_buffer(cmd, &begin_info)
-                .context("Failed to begin recording Command Buffer!")?;
-        }
-
-        Ok(cmd)
-    }
-
-    pub fn end_recording(&self, cmd: vk::CommandBuffer) -> Result<vk::CommandBuffer> {
-        unsafe {
-            self.dev_ctx
-                .handle
-                .end_command_buffer(cmd)
-                .context("Failed to end recording Command Buffer!")?;
-        }
-
-        Ok(cmd)
-    }
-
     pub fn copy_buffer(
         &self,
         queue: vk::Queue,
@@ -1289,32 +1189,169 @@ impl GeometryBundle {
     }
 }
 
-struct FrameBundle {
+struct UniformBundle {
     dev_ctx: Arc<DeviceContext>,
-    cmd_buffer: vk::CommandBuffer,
-    s_image_available: vk::Semaphore,
-    s_render_finished: vk::Semaphore,
-    f_in_flight: vk::Fence,
-
-    u_buffer: BufferBundle,
-    u_buffer_mapped: *mut std::ffi::c_void,
+    layout: vk::DescriptorSetLayout,
+    pool: vk::DescriptorPool,
+    buffers: Vec<BufferBundle>,
+    mapped_ptrs: Vec<*mut c_void>,
+    sets: Vec<vk::DescriptorSet>,
 }
 
-impl FrameBundle {
-    fn new(dev_ctx: Arc<DeviceContext>, cmd_buffer: vk::CommandBuffer) -> Result<Self> {
+impl UniformBundle {
+    pub fn new(dev_ctx: Arc<DeviceContext>, size: usize) -> Result<Self> {
         let mut bundle = Self {
             dev_ctx: dev_ctx.clone(),
-            cmd_buffer,
-            s_image_available: vk::Semaphore::null(),
-            s_render_finished: vk::Semaphore::null(),
-            f_in_flight: vk::Fence::null(),
-            u_buffer: BufferBundle::new(
+            layout: Self::create_ubo_layout(&dev_ctx.handle)?,
+            pool: vk::DescriptorPool::null(),
+            buffers: Vec::new(),
+            sets: Vec::new(),
+            mapped_ptrs: Vec::new(),
+        };
+        (bundle.buffers, bundle.mapped_ptrs) = Self::create_ubo(dev_ctx, size)?;
+        bundle.pool = Self::create_descriptor_pool(&bundle.dev_ctx.handle, size)?;
+        bundle.sets = Self::create_descriptor_sets(
+            &bundle.dev_ctx.handle,
+            &bundle.pool,
+            &bundle.layout,
+            size,
+        )?;
+
+        Ok(bundle)
+    }
+
+    fn create_ubo_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+        let ubo_binding = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_binding);
+
+        let layout = unsafe {
+            device
+                .create_descriptor_set_layout(&layout_info, None)
+                .context("Failed to create Descriptor Set Layout!")?
+        };
+
+        Ok(layout)
+    }
+
+    fn create_ubo(
+        dev_ctx: Arc<DeviceContext>,
+        size: usize,
+    ) -> Result<(Vec<BufferBundle>, Vec<*mut c_void>)> {
+        let mut buffers = Vec::with_capacity(size);
+        let mut mapped_ptrs = Vec::with_capacity(size);
+
+        for _ in 0..size {
+            let buffer = BufferBundle::new(
                 dev_ctx.clone(),
                 size_of::<UniformBufferObject>() as vk::DeviceSize,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?,
-            u_buffer_mapped: std::ptr::null_mut(),
+            )?;
+            let mapped_ptr = unsafe {
+                dev_ctx.handle.map_memory(
+                    buffer.memory,
+                    0,
+                    buffer.size,
+                    vk::MemoryMapFlags::empty(),
+                )
+            }
+            .context("Failed to map Uniform Buffer memory!")?;
+
+            buffers.push(buffer);
+            mapped_ptrs.push(mapped_ptr);
+        }
+
+        Ok((buffers, mapped_ptrs))
+    }
+
+    fn create_descriptor_pool(device: &ash::Device, size: usize) -> Result<vk::DescriptorPool> {
+        let pool_size = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(size as u32)];
+        let pool_info =
+            vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_size).max_sets(size as u32);
+
+        let pool = unsafe {
+            device
+                .create_descriptor_pool(&pool_info, None)
+                .context("Failed to create Descriptor Pool!")?
+        };
+
+        Ok(pool)
+    }
+
+    fn create_descriptor_sets(
+        device: &ash::Device,
+        pool: &vk::DescriptorPool,
+        layout: &vk::DescriptorSetLayout,
+        size: usize,
+    ) -> Result<Vec<vk::DescriptorSet>> {
+        let layouts = vec![*layout; size];
+        let alloc_info =
+            vk::DescriptorSetAllocateInfo::default().descriptor_pool(*pool).set_layouts(&layouts);
+
+        let descriptor_sets = unsafe {
+            device
+                .allocate_descriptor_sets(&alloc_info)
+                .context("Failed to allocate Descriptor Sets!")?
+        };
+
+        Ok(descriptor_sets)
+    }
+
+    fn update_descriptor_set(device: &ash::Device, buffer: &vk::Buffer, set: &vk::DescriptorSet) {
+        let buffer_info =
+            [vk::DescriptorBufferInfo::default().buffer(*buffer).offset(0).range(vk::WHOLE_SIZE)];
+        let descriptor_write = [vk::WriteDescriptorSet::default()
+            .dst_set(*set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(&buffer_info)];
+
+        unsafe { device.update_descriptor_sets(&descriptor_write, &[]) };
+    }
+}
+
+impl Drop for UniformBundle {
+    fn drop(&mut self) {
+        unsafe {
+            self.dev_ctx.handle.destroy_descriptor_pool(self.pool, None);
+            self.dev_ctx.handle.destroy_descriptor_set_layout(self.layout, None);
+        }
+    }
+}
+
+struct FrameBundle {
+    dev_ctx: Arc<DeviceContext>,
+
+    s_image_available: vk::Semaphore,
+    s_render_finished: vk::Semaphore,
+    f_in_flight: vk::Fence,
+
+    cmd_buffer: vk::CommandBuffer,
+    descriptor_set: vk::DescriptorSet,
+    u_buffer_mapped: *mut c_void,
+}
+
+impl FrameBundle {
+    fn new(
+        dev_ctx: Arc<DeviceContext>,
+        cmd_buffer: vk::CommandBuffer,
+        descriptor_set: vk::DescriptorSet,
+        u_buffer_mapped: *mut c_void,
+    ) -> Result<Self> {
+        let mut bundle = Self {
+            dev_ctx: dev_ctx.clone(),
+            s_image_available: vk::Semaphore::null(),
+            s_render_finished: vk::Semaphore::null(),
+            f_in_flight: vk::Fence::null(),
+            cmd_buffer,
+            descriptor_set,
+            u_buffer_mapped,
         };
 
         unsafe {
@@ -1333,13 +1370,6 @@ impl FrameBundle {
                 .handle
                 .create_fence(&fence_info, None)
                 .context("Failed to create In Flight Fence!")?;
-
-            bundle.u_buffer_mapped = dev_ctx.handle.map_memory(
-                bundle.u_buffer.memory,
-                0,
-                bundle.u_buffer.size,
-                vk::MemoryMapFlags::empty(),
-            )?;
         }
 
         Ok(bundle)
@@ -1370,8 +1400,6 @@ impl FrameBundle {
 impl Drop for FrameBundle {
     fn drop(&mut self) {
         unsafe {
-            self.dev_ctx.handle.unmap_memory(self.u_buffer.memory);
-
             self.dev_ctx.handle.destroy_semaphore(self.s_image_available, None);
             self.dev_ctx.handle.destroy_semaphore(self.s_render_finished, None);
             self.dev_ctx.handle.destroy_fence(self.f_in_flight, None);
@@ -1381,9 +1409,11 @@ impl Drop for FrameBundle {
 
 struct Engine {
     dev_ctx: Arc<DeviceContext>,
+
+    _ubo: UniformBundle,
     pipeline: PipelineBundle,
     swapchain: SwapchainBundle,
-    command: CommandBundle,
+    _command: CommandBundle,
 
     geometry: GeometryBundle,
     frames: Vec<FrameBundle>,
@@ -1395,23 +1425,35 @@ impl Engine {
     pub fn new(window: &Window, required_extensions: &[*const i8]) -> Result<Self> {
         let vk_ctx = Arc::new(VulkanContext::init(window, required_extensions)?);
         let dev_ctx = Arc::new(DeviceContext::init(vk_ctx.clone())?);
-        let pipeline = PipelineBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
+
+        let ubo = UniformBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
+        let pipeline = PipelineBundle::new(dev_ctx.clone(), &ubo.layout)?;
         let swapchain = SwapchainBundle::new(dev_ctx.clone())?;
         let command = CommandBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
 
         let geometry = GeometryBundle::new(dev_ctx.clone(), &command, &VERTICES, &INDICES)?;
         let frames: Vec<_> = (0..MAX_FRAMES_IN_FLIGHT)
-            .map(|idx| FrameBundle::new(dev_ctx.clone(), command.buffers[idx]))
+            .map(|idx| {
+                UniformBundle::update_descriptor_set(
+                    &dev_ctx.handle,
+                    &ubo.buffers[idx].buffer,
+                    &ubo.sets[idx],
+                );
+                FrameBundle::new(
+                    dev_ctx.clone(),
+                    command.buffers[idx],
+                    ubo.sets[idx],
+                    ubo.mapped_ptrs[idx],
+                )
+            })
             .collect::<Result<_>>()?;
-        frames.iter().enumerate().for_each(|(idx, frame)| {
-            pipeline.update_descriptor_set(idx, &frame.u_buffer.buffer);
-        });
 
         Ok(Engine {
             dev_ctx,
+            _ubo: ubo,
             pipeline,
             swapchain,
-            command,
+            _command: command,
             geometry,
             frames,
             current_frame: 0,
@@ -1456,7 +1498,7 @@ impl Engine {
                 .reset_fences(&wait_fences)
                 .context("Failed to reset In Flight Fence!")?;
 
-            let cmd = [self.record_command(image_index)?];
+            let cmd = [self.record_command(image_index, frame.cmd_buffer)?];
             let wait_semaphores = [frame.s_image_available];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let signal_semaphores = [frame.s_render_finished];
@@ -1508,27 +1550,18 @@ impl Engine {
         Ok(())
     }
 
-    fn record_command(&self, image_index: u32) -> Result<vk::CommandBuffer> {
-        let cmd = self.command.begin_recording(self.current_frame)?;
-
-        let color_attachment_info = [vk::RenderingAttachmentInfo::default()
-            .image_view(self.swapchain.image_views[image_index as usize])
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
-            })];
-
-        let render_info = vk::RenderingInfo::default()
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: self.swapchain.extent,
-            })
-            .layer_count(1)
-            .color_attachments(&color_attachment_info);
-
+    fn record_command(
+        &self,
+        image_index: u32,
+        cmd: vk::CommandBuffer,
+    ) -> Result<vk::CommandBuffer> {
         unsafe {
+            let begin_info = vk::CommandBufferBeginInfo::default();
+            self.dev_ctx
+                .handle
+                .begin_command_buffer(cmd, &begin_info)
+                .context("Failed to begin recording Command Buffer!")?;
+
             let image_memory_barrier = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                 .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_READ)
@@ -1548,6 +1581,22 @@ impl Engine {
                 vk::DependencyInfo::default().image_memory_barriers(&image_memory_barrier);
             self.dev_ctx.sync2.cmd_pipeline_barrier2(cmd, &dependency_info);
 
+            let color_attachment_info = [vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain.image_views[image_index as usize])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
+                })];
+
+            let render_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: self.swapchain.extent,
+                })
+                .layer_count(1)
+                .color_attachments(&color_attachment_info);
             self.dev_ctx.dyn_render.cmd_begin_rendering(cmd, &render_info);
             self.dev_ctx.handle.cmd_bind_pipeline(
                 cmd,
@@ -1586,12 +1635,13 @@ impl Engine {
                 0,
                 vk::IndexType::UINT16,
             );
+            let frame = &self.frames[self.current_frame];
             self.dev_ctx.handle.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline.layout,
                 0,
-                &[self.pipeline.ubo_sets[self.current_frame]],
+                &[frame.descriptor_set],
                 &[],
             );
             self.dev_ctx.handle.cmd_draw_indexed(cmd, INDICES.len() as u32, 1, 0, 0, 0);
@@ -1615,8 +1665,12 @@ impl Engine {
             let dependency_info =
                 vk::DependencyInfo::default().image_memory_barriers(&image_memory_barrier);
             self.dev_ctx.sync2.cmd_pipeline_barrier2(cmd, &dependency_info);
-            self.command.end_recording(cmd)
+            self.dev_ctx
+                .handle
+                .end_command_buffer(cmd)
+                .context("Failed to end recording Command Buffer!")?;
         }
+        Ok(cmd)
     }
 }
 
