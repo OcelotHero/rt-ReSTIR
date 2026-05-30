@@ -16,3 +16,4 @@ winit = { version = "0.30.13", features = ["rwh_06"] }
 raw-window-handle = "0.6"
 inline-spirv = "0.2.1"
 cgmath = "0.18.0"
+stb_image = "0.3.0"

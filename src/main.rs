@@ -1,5 +1,3 @@
-extern crate winit;
-
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
@@ -13,6 +11,8 @@ use std::ffi::{CStr, CString};
 use std::mem::{offset_of, size_of};
 use std::os::raw::c_void;
 use std::sync::Arc;
+
+use stb_image::image;
 
 use cgmath::{Deg, Matrix4, Point3, Vector3};
 
@@ -33,14 +33,21 @@ const VALIDATION: ValidationInfo =
     ValidationInfo { enabled: true, required_validation_layers: [c"VK_LAYER_KHRONOS_validation"] };
 
 #[cfg(not(target_os = "macos"))]
-const DEVICE_EXTENSIONS: [&'static CStr; 3] =
-    [c"VK_KHR_swapchain", c"VK_KHR_dynamic_rendering", c"VK_KHR_synchronization2"];
+const DEVICE_EXTENSIONS: [&'static CStr; 5] = [
+    c"VK_KHR_swapchain",
+    c"VK_KHR_dynamic_rendering",
+    c"VK_KHR_synchronization2",
+    c"VK_KHR_uniform_buffer_standard_layout",
+    c"VK_KHR_copy_commands2",
+];
 #[cfg(target_os = "macos")]
-const DEVICE_EXTENSIONS: [&'static CStr; 4] = [
+const DEVICE_EXTENSIONS: [&'static CStr; 6] = [
     c"VK_KHR_swapchain",
     c"VK_KHR_portability_subset",
     c"VK_KHR_dynamic_rendering",
     c"VK_KHR_synchronization2",
+    c"VK_KHR_uniform_buffer_standard_layout",
+    c"VK_KHR_copy_commands2",
 ];
 
 #[repr(C)]
@@ -56,6 +63,7 @@ struct UniformBufferObject {
 struct Vertex {
     pos: [f32; 2],
     color: [f32; 3],
+    tex_coord: [f32; 2],
 }
 
 impl Vertex {
@@ -66,7 +74,7 @@ impl Vertex {
             .input_rate(vk::VertexInputRate::VERTEX)
     }
 
-    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    pub fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         [
             vk::VertexInputAttributeDescription::default()
                 .binding(0)
@@ -78,15 +86,20 @@ impl Vertex {
                 .location(1)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(offset_of!(Self, color) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(2)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(Self, tex_coord) as u32),
         ]
     }
 }
 
 const VERTICES: [Vertex; 4] = [
-    Vertex { pos: [-0.5, -0.5], color: [1.0, 0.0, 0.0] },
-    Vertex { pos: [0.5, -0.5], color: [0.0, 1.0, 0.0] },
-    Vertex { pos: [0.5, 0.5], color: [0.0, 0.0, 1.0] },
-    Vertex { pos: [-0.5, 0.5], color: [1.0, 1.0, 1.0] },
+    Vertex { pos: [-0.5, -0.5], color: [1.0, 0.0, 0.0], tex_coord: [1.0, 0.0] },
+    Vertex { pos: [0.5, -0.5], color: [0.0, 1.0, 0.0], tex_coord: [0.0, 0.0] },
+    Vertex { pos: [0.5, 0.5], color: [0.0, 0.0, 1.0], tex_coord: [0.0, 1.0] },
+    Vertex { pos: [-0.5, 0.5], color: [1.0, 1.0, 1.0], tex_coord: [1.0, 1.0] },
 ];
 
 const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
@@ -472,12 +485,15 @@ impl DeviceContext {
             features13.synchronization2 == vk::TRUE || sync2_features.synchronization2 == vk::TRUE;
         let dyn_render_supported = has_dyn_render && has_sync2;
 
+        let features = unsafe { instance.get_physical_device_features(*device) };
+
         Ok((
             indices,
             indices.is_complete()
                 && extensions_supported
                 && swapchain_adequate
-                && dyn_render_supported,
+                && dyn_render_supported
+                && features.sampler_anisotropy == vk::TRUE,
         ))
     }
 
@@ -542,11 +558,17 @@ impl DeviceContext {
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
         let mut sync2_feature =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut scalar_block_layout_feature =
+            vk::PhysicalDeviceScalarBlockLayoutFeatures::default().scalar_block_layout(true);
+        let sampler_anisotropy_feature =
+            vk::PhysicalDeviceFeatures::default().sampler_anisotropy(true);
         let create_info = vk::DeviceCreateInfo::default()
             .push_next(&mut dyn_render_feature)
             .push_next(&mut sync2_feature)
+            .push_next(&mut scalar_block_layout_feature)
             .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&device_extensions);
+            .enabled_extension_names(&device_extensions)
+            .enabled_features(&sampler_anisotropy_feature);
 
         let device = unsafe {
             instance
@@ -555,6 +577,41 @@ impl DeviceContext {
         };
 
         Ok(device)
+    }
+
+    pub fn find_memory_type(
+        &self,
+        type_filter: u32,
+        properties: &vk::MemoryPropertyFlags,
+    ) -> Result<u32> {
+        let mem_properties =
+            unsafe { self.vk_ctx.instance.get_physical_device_memory_properties(self.device) };
+
+        for (i, mem_type) in mem_properties.memory_types.iter().enumerate() {
+            if (type_filter & (1 << i)) != 0 && mem_type.property_flags.contains(*properties) {
+                return Ok(i as u32);
+            }
+        }
+
+        bail!("Failed to find suitable memory type!")
+    }
+
+    pub fn allocate_memory(
+        &self,
+        requirements: &vk::MemoryRequirements,
+        properties: &vk::MemoryPropertyFlags,
+    ) -> Result<vk::DeviceMemory> {
+        let mem_type = self.find_memory_type(requirements.memory_type_bits, properties)?;
+
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(mem_type);
+
+        let memory = unsafe {
+            self.handle.allocate_memory(&alloc_info, None).context("Failed to allocate Memory!")?
+        };
+
+        Ok(memory)
     }
 }
 
@@ -771,7 +828,10 @@ impl SwapchainBundle {
             images,
             image_views: Vec::new(),
         };
-        bundle.image_views = Self::create_image_views(&device, &format, &bundle.images)?;
+
+        for image in bundle.images.iter() {
+            bundle.image_views.push(Self::create_image_view(device, &format, image)?);
+        }
 
         Ok(bundle)
     }
@@ -896,36 +956,29 @@ impl SwapchainBundle {
         }
     }
 
-    fn create_image_views(
+    fn create_image_view(
         device: &ash::Device,
         format: &vk::Format,
-        images: &Vec<vk::Image>,
-    ) -> Result<Vec<vk::ImageView>> {
-        let mut image_views = Vec::with_capacity(images.len());
+        image: &vk::Image,
+    ) -> Result<vk::ImageView> {
+        let create_info = vk::ImageViewCreateInfo::default()
+            .image(*image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(*format)
+            .components(vk::ComponentMapping::default())
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
 
-        for &image in images.iter() {
-            let create_info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(*format)
-                .components(vk::ComponentMapping::default())
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
+        let image_view = unsafe {
+            device.create_image_view(&create_info, None).context("Failed to create Image View!")?
+        };
 
-            let image_view = unsafe {
-                device
-                    .create_image_view(&create_info, None)
-                    .context("Failed to create Image View!")?
-            };
-            image_views.push(image_view);
-        }
-
-        Ok(image_views)
+        Ok(image_view)
     }
 }
 
@@ -1002,30 +1055,138 @@ impl CommandBundle {
         dst: &BufferBundle,
         size: vk::DeviceSize,
     ) -> Result<()> {
-        let device = &self.dev_ctx.handle;
+        unsafe {
+            let cmd = self.begin_single_time_commands()?;
 
-        let cmd = [Self::create_command_buffers(device, &self.pool, 1)?[0]];
+            let copy_region = [vk::BufferCopy2::default().size(size)];
+            let copy_buffer_info = vk::CopyBufferInfo2::default()
+                .src_buffer(src.buffer)
+                .dst_buffer(dst.buffer)
+                .regions(&copy_region);
+            self.dev_ctx.handle.cmd_copy_buffer2(cmd, &copy_buffer_info);
+
+            self.end_single_time_commands(cmd, queue)
+        }
+    }
+
+    pub fn transition_image_layout(
+        &self,
+        queue: vk::Queue,
+        image: vk::Image,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) -> Result<()> {
+        unsafe {
+            let cmd = self.begin_single_time_commands()?;
+
+            let (src_access_mask, dst_access_mask, src_stage, dst_stage) =
+                match (old_layout, new_layout) {
+                    (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+                        vk::AccessFlags2::empty(),
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::TOP_OF_PIPE,
+                        vk::PipelineStageFlags2::TRANSFER,
+                    ),
+                    (
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    ) => (
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::AccessFlags2::SHADER_READ,
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    ),
+                    _ => bail!("Unsupported layout transition!"),
+                };
+
+            let barrier = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access_mask)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .old_layout(old_layout)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access_mask)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .new_layout(new_layout)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })];
+
+            let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&barrier);
+            self.dev_ctx.sync2.cmd_pipeline_barrier2(cmd, &dependency_info);
+
+            self.end_single_time_commands(cmd, queue)
+        }
+    }
+
+    fn copy_buffer_to_image(
+        &self,
+        queue: vk::Queue,
+        buffer: &BufferBundle,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        unsafe {
+            let cmd = self.begin_single_time_commands()?;
+
+            let region = [vk::BufferImageCopy2::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                .image_extent(vk::Extent3D { width, height, depth: 1 })];
+
+            let copy_buffer_info = vk::CopyBufferToImageInfo2::default()
+                .src_buffer(buffer.buffer)
+                .dst_image(image)
+                .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .regions(&region);
+            self.dev_ctx.handle.cmd_copy_buffer_to_image2(cmd, &copy_buffer_info);
+
+            self.end_single_time_commands(cmd, queue)
+        }
+    }
+
+    fn begin_single_time_commands(&self) -> Result<vk::CommandBuffer> {
+        let cmd = Self::create_command_buffers(&self.dev_ctx.handle, &self.pool, 1)?[0];
         let begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
         unsafe {
-            device
-                .begin_command_buffer(cmd[0], &begin_info)
+            self.dev_ctx
+                .handle
+                .begin_command_buffer(cmd, &begin_info)
                 .context("Failed to begin recording Command Buffer!")?;
+        }
 
-            let copy_region = vk::BufferCopy::default().size(size);
-            device.cmd_copy_buffer(cmd[0], src.buffer, dst.buffer, &[copy_region]);
+        Ok(cmd)
+    }
 
-            device
-                .end_command_buffer(cmd[0])
+    fn end_single_time_commands(&self, cmd: vk::CommandBuffer, queue: vk::Queue) -> Result<()> {
+        unsafe {
+            self.dev_ctx
+                .handle
+                .end_command_buffer(cmd)
                 .context("Failed to end recording Command Buffer!")?;
 
+            let cmd = [cmd];
             let submit_info = vk::SubmitInfo::default().command_buffers(&cmd);
-            device.queue_submit(queue, &[submit_info], vk::Fence::null())?;
+            self.dev_ctx.handle.queue_submit(queue, &[submit_info], vk::Fence::null())?;
 
-            // Block CPU until execution finishes
-            device.queue_wait_idle(queue)?;
-            device.free_command_buffers(self.pool, &cmd);
+            self.dev_ctx.handle.queue_wait_idle(queue)?;
+            self.dev_ctx.handle.free_command_buffers(self.pool, &cmd);
         }
 
         Ok(())
@@ -1068,39 +1229,11 @@ impl BufferBundle {
 
         let mem_requirements =
             unsafe { dev_ctx.handle.get_buffer_memory_requirements(bundle.buffer) };
-        let mem_type = Self::find_memory_type(
-            &dev_ctx.vk_ctx.instance,
-            &dev_ctx.device,
-            mem_requirements.memory_type_bits,
-            &properties,
-        )?;
-
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(mem_type);
-        bundle.memory = unsafe { dev_ctx.handle.allocate_memory(&alloc_info, None)? };
+        bundle.memory = dev_ctx.allocate_memory(&mem_requirements, &properties)?;
 
         unsafe { dev_ctx.handle.bind_buffer_memory(bundle.buffer, bundle.memory, 0)? };
 
         Ok(bundle)
-    }
-
-    fn find_memory_type(
-        instance: &ash::Instance,
-        physical_device: &vk::PhysicalDevice,
-        type_filter: u32,
-        properties: &vk::MemoryPropertyFlags,
-    ) -> Result<u32> {
-        let mem_properties =
-            unsafe { instance.get_physical_device_memory_properties(*physical_device) };
-
-        for (i, mem_type) in mem_properties.memory_types.iter().enumerate() {
-            if (type_filter & (1 << i)) != 0 && mem_type.property_flags.contains(*properties) {
-                return Ok(i as u32);
-            }
-        }
-
-        bail!("Failed to find suitable memory type!")
     }
 
     pub fn fill_buffer<T: Copy>(&self, data: &[T]) -> Result<()> {
@@ -1189,68 +1322,121 @@ impl GeometryBundle {
     }
 }
 
-struct UniformBundle {
+struct DescriptorBundle {
     dev_ctx: Arc<DeviceContext>,
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
-    buffers: Vec<BufferBundle>,
-    mapped_ptrs: Vec<*mut c_void>,
     sets: Vec<vk::DescriptorSet>,
 }
 
-impl UniformBundle {
-    pub fn new(dev_ctx: Arc<DeviceContext>, size: usize) -> Result<Self> {
+impl DescriptorBundle {
+    pub fn new(
+        dev_ctx: Arc<DeviceContext>,
+        bindings: &[vk::DescriptorSetLayoutBinding],
+        pool_sizes: &[vk::DescriptorPoolSize],
+        max_sets: u32,
+    ) -> Result<Self> {
         let mut bundle = Self {
             dev_ctx: dev_ctx.clone(),
-            layout: Self::create_ubo_layout(&dev_ctx.handle)?,
+            layout: vk::DescriptorSetLayout::null(),
             pool: vk::DescriptorPool::null(),
-            buffers: Vec::new(),
             sets: Vec::new(),
-            mapped_ptrs: Vec::new(),
         };
-        (bundle.buffers, bundle.mapped_ptrs) = Self::create_ubo(dev_ctx, size)?;
-        bundle.pool = Self::create_descriptor_pool(&bundle.dev_ctx.handle, size)?;
-        bundle.sets = Self::create_descriptor_sets(
-            &bundle.dev_ctx.handle,
-            &bundle.pool,
-            &bundle.layout,
-            size,
-        )?;
 
-        Ok(bundle)
-    }
-
-    fn create_ubo_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-        let ubo_binding = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_binding);
-
-        let layout = unsafe {
-            device
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings);
+        bundle.layout = unsafe {
+            dev_ctx
+                .handle
                 .create_descriptor_set_layout(&layout_info, None)
                 .context("Failed to create Descriptor Set Layout!")?
         };
 
-        Ok(layout)
+        let pool_info =
+            vk::DescriptorPoolCreateInfo::default().pool_sizes(pool_sizes).max_sets(max_sets);
+        bundle.pool = unsafe {
+            dev_ctx
+                .handle
+                .create_descriptor_pool(&pool_info, None)
+                .context("Failed to create Descriptor Pool!")?
+        };
+
+        let layouts = vec![bundle.layout; max_sets as usize];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(bundle.pool)
+            .set_layouts(&layouts);
+        bundle.sets = unsafe {
+            dev_ctx
+                .handle
+                .allocate_descriptor_sets(&alloc_info)
+                .context("Failed to allocate Descriptor Sets!")?
+        };
+
+        Ok(bundle)
     }
 
-    fn create_ubo(
-        dev_ctx: Arc<DeviceContext>,
-        size: usize,
-    ) -> Result<(Vec<BufferBundle>, Vec<*mut c_void>)> {
-        let mut buffers = Vec::with_capacity(size);
-        let mut mapped_ptrs = Vec::with_capacity(size);
+    pub fn update_unified_descriptor_sets(
+        device: &ash::Device,
+        descriptor_set: &vk::DescriptorSet,
+        ubo_bundle: &BufferBundle,
+        texture_bundle: &TextureBundle,
+    ) {
+        let buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(ubo_bundle.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
 
-        for _ in 0..size {
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(texture_bundle.view)
+            .sampler(texture_bundle.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+
+        let descriptor_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(*descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(&buffer_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(*descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info),
+        ];
+
+        unsafe {
+            device.update_descriptor_sets(&descriptor_writes, &[]);
+        }
+    }
+}
+
+impl Drop for DescriptorBundle {
+    fn drop(&mut self) {
+        unsafe {
+            self.dev_ctx.handle.destroy_descriptor_pool(self.pool, None);
+            self.dev_ctx.handle.destroy_descriptor_set_layout(self.layout, None);
+        }
+    }
+}
+
+struct UniformBundle {
+    buffers: Vec<BufferBundle>,
+    mapped_ptrs: Vec<*mut c_void>,
+}
+
+impl UniformBundle {
+    pub fn new(dev_ctx: Arc<DeviceContext>, count: usize) -> Result<Self> {
+        let mut buffers = Vec::with_capacity(count);
+        let mut mapped_ptrs = Vec::with_capacity(count);
+        let buffer_size = size_of::<UniformBufferObject>() as vk::DeviceSize;
+
+        for _ in 0..count {
             let buffer = BufferBundle::new(
                 dev_ctx.clone(),
-                size_of::<UniformBufferObject>() as vk::DeviceSize,
+                buffer_size,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )?;
+
             let mapped_ptr = unsafe {
                 dev_ctx.handle.map_memory(
                     buffer.memory,
@@ -1265,63 +1451,7 @@ impl UniformBundle {
             mapped_ptrs.push(mapped_ptr);
         }
 
-        Ok((buffers, mapped_ptrs))
-    }
-
-    fn create_descriptor_pool(device: &ash::Device, size: usize) -> Result<vk::DescriptorPool> {
-        let pool_size = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(size as u32)];
-        let pool_info =
-            vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_size).max_sets(size as u32);
-
-        let pool = unsafe {
-            device
-                .create_descriptor_pool(&pool_info, None)
-                .context("Failed to create Descriptor Pool!")?
-        };
-
-        Ok(pool)
-    }
-
-    fn create_descriptor_sets(
-        device: &ash::Device,
-        pool: &vk::DescriptorPool,
-        layout: &vk::DescriptorSetLayout,
-        size: usize,
-    ) -> Result<Vec<vk::DescriptorSet>> {
-        let layouts = vec![*layout; size];
-        let alloc_info =
-            vk::DescriptorSetAllocateInfo::default().descriptor_pool(*pool).set_layouts(&layouts);
-
-        let descriptor_sets = unsafe {
-            device
-                .allocate_descriptor_sets(&alloc_info)
-                .context("Failed to allocate Descriptor Sets!")?
-        };
-
-        Ok(descriptor_sets)
-    }
-
-    fn update_descriptor_set(device: &ash::Device, buffer: &vk::Buffer, set: &vk::DescriptorSet) {
-        let buffer_info =
-            [vk::DescriptorBufferInfo::default().buffer(*buffer).offset(0).range(vk::WHOLE_SIZE)];
-        let descriptor_write = [vk::WriteDescriptorSet::default()
-            .dst_set(*set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-            .buffer_info(&buffer_info)];
-
-        unsafe { device.update_descriptor_sets(&descriptor_write, &[]) };
-    }
-}
-
-impl Drop for UniformBundle {
-    fn drop(&mut self) {
-        unsafe {
-            self.dev_ctx.handle.destroy_descriptor_pool(self.pool, None);
-            self.dev_ctx.handle.destroy_descriptor_set_layout(self.layout, None);
-        }
+        Ok(Self { buffers, mapped_ptrs })
     }
 }
 
@@ -1407,14 +1537,183 @@ impl Drop for FrameBundle {
     }
 }
 
+struct TextureBundle {
+    dev_ctx: Arc<DeviceContext>,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+}
+
+impl TextureBundle {
+    pub fn new(
+        dev_ctx: Arc<DeviceContext>,
+        command: &CommandBundle,
+        path: &str,
+        properties: vk::MemoryPropertyFlags,
+    ) -> Result<Self> {
+        let (staging, image, width, height) = Self::create_texture_image(dev_ctx.clone(), path)?;
+
+        let mut bundle = Self {
+            dev_ctx: dev_ctx.clone(),
+            image,
+            memory: vk::DeviceMemory::null(),
+            view: vk::ImageView::null(),
+            sampler: vk::Sampler::null(),
+        };
+
+        let mem_requirements =
+            unsafe { dev_ctx.handle.get_image_memory_requirements(bundle.image) };
+        bundle.memory = dev_ctx.allocate_memory(&mem_requirements, &properties)?;
+
+        unsafe { dev_ctx.handle.bind_image_memory(bundle.image, bundle.memory, 0)? };
+
+        CommandBundle::transition_image_layout(
+            command,
+            dev_ctx.graphics_queue,
+            bundle.image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        )?;
+        CommandBundle::copy_buffer_to_image(
+            command,
+            dev_ctx.graphics_queue,
+            &staging,
+            bundle.image,
+            width as u32,
+            height as u32,
+        )?;
+        CommandBundle::transition_image_layout(
+            command,
+            dev_ctx.graphics_queue,
+            bundle.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )?;
+
+        bundle.view = Self::create_texture_image_view(&dev_ctx.handle, bundle.image)?;
+        bundle.sampler = Self::create_texture_sampler(
+            &dev_ctx.handle,
+            &dev_ctx.vk_ctx.instance,
+            &dev_ctx.device,
+        )?;
+
+        Ok(bundle)
+    }
+
+    fn create_texture_image(
+        dev_ctx: Arc<DeviceContext>,
+        path: &str,
+    ) -> Result<(BufferBundle, vk::Image, usize, usize)> {
+        let img = match image::load_with_depth(path, 4, true) {
+            image::LoadResult::Error(err) => bail!("Failed to load texture image: {err}"),
+            image::LoadResult::ImageU8(img) => img,
+            image::LoadResult::ImageF32(_) => bail!("Failed to convert HDR image!"),
+        };
+        let image_size = (img.width * img.height * 4) as vk::DeviceSize;
+        let staging = BufferBundle::new(
+            dev_ctx.clone(),
+            image_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        staging.fill_buffer(&img.data)?;
+
+        let image = Self::create_image(
+            &dev_ctx.handle,
+            img.width as u32,
+            img.height as u32,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        )?;
+
+        Ok((staging, image, img.width, img.height))
+    }
+
+    fn create_image(
+        device: &ash::Device,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        tilling: vk::ImageTiling,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<vk::Image> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(tilling)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let img = unsafe {
+            device.create_image(&image_info, None).context("Failed to create Texture Image!")?
+        };
+
+        Ok(img)
+    }
+
+    fn create_texture_image_view(device: &ash::Device, image: vk::Image) -> Result<vk::ImageView> {
+        SwapchainBundle::create_image_view(device, &vk::Format::R8G8B8A8_SRGB, &image)
+    }
+
+    fn create_texture_sampler(
+        device: &ash::Device,
+        instance: &ash::Instance,
+        physical_device: &vk::PhysicalDevice,
+    ) -> Result<vk::Sampler> {
+        let properties = unsafe { instance.get_physical_device_properties(*physical_device) };
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(true)
+            .max_anisotropy(properties.limits.max_sampler_anisotropy)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false)
+            .compare_enable(false)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR);
+
+        let sampler = unsafe {
+            device
+                .create_sampler(&sampler_info, None)
+                .context("Failed to create Texture Sampler!")?
+        };
+
+        Ok(sampler)
+    }
+}
+
+impl Drop for TextureBundle {
+    fn drop(&mut self) {
+        unsafe {
+            self.dev_ctx.handle.destroy_sampler(self.sampler, None);
+            self.dev_ctx.handle.destroy_image_view(self.view, None);
+            self.dev_ctx.handle.destroy_image(self.image, None);
+            self.dev_ctx.handle.free_memory(self.memory, None);
+        }
+    }
+}
+
 struct Engine {
     dev_ctx: Arc<DeviceContext>,
 
+    _descriptor: DescriptorBundle,
     _ubo: UniformBundle,
     pipeline: PipelineBundle,
     swapchain: SwapchainBundle,
     _command: CommandBundle,
 
+    _texture: TextureBundle,
     geometry: GeometryBundle,
     frames: Vec<FrameBundle>,
     current_frame: usize,
@@ -1426,23 +1725,58 @@ impl Engine {
         let vk_ctx = Arc::new(VulkanContext::init(window, required_extensions)?);
         let dev_ctx = Arc::new(DeviceContext::init(vk_ctx.clone())?);
 
+        let ubo_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX);
+        let sampler_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let bindings = [ubo_binding, sampler_binding];
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32),
+        ];
+
+        let descriptor = DescriptorBundle::new(
+            dev_ctx.clone(),
+            &bindings,
+            &pool_sizes,
+            MAX_FRAMES_IN_FLIGHT as u32,
+        )?;
+
         let ubo = UniformBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
-        let pipeline = PipelineBundle::new(dev_ctx.clone(), &ubo.layout)?;
+        let pipeline = PipelineBundle::new(dev_ctx.clone(), &descriptor.layout)?;
         let swapchain = SwapchainBundle::new(dev_ctx.clone())?;
         let command = CommandBundle::new(dev_ctx.clone(), MAX_FRAMES_IN_FLIGHT)?;
 
+        let texture = TextureBundle::new(
+            dev_ctx.clone(),
+            &command,
+            "textures/texture.jpg",
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
         let geometry = GeometryBundle::new(dev_ctx.clone(), &command, &VERTICES, &INDICES)?;
         let frames: Vec<_> = (0..MAX_FRAMES_IN_FLIGHT)
             .map(|idx| {
-                UniformBundle::update_descriptor_set(
+                DescriptorBundle::update_unified_descriptor_sets(
                     &dev_ctx.handle,
-                    &ubo.buffers[idx].buffer,
-                    &ubo.sets[idx],
+                    &descriptor.sets[idx],
+                    &ubo.buffers[idx],
+                    &texture,
                 );
                 FrameBundle::new(
                     dev_ctx.clone(),
                     command.buffers[idx],
-                    ubo.sets[idx],
+                    descriptor.sets[idx],
                     ubo.mapped_ptrs[idx],
                 )
             })
@@ -1450,10 +1784,12 @@ impl Engine {
 
         Ok(Engine {
             dev_ctx,
+            _descriptor: descriptor,
             _ubo: ubo,
             pipeline,
             swapchain,
             _command: command,
+            _texture: texture,
             geometry,
             frames,
             current_frame: 0,
